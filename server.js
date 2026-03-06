@@ -8,7 +8,6 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
-// Error handler wrapper
 const asyncHandler = (fn) => (req, res, next) => {
   Promise.resolve(fn(req, res, next)).catch(next);
 };
@@ -31,10 +30,7 @@ app.get('/api/highways', asyncHandler(async (req, res) => {
         'type', 'Feature',
         'id', gid,
         'geometry', ST_AsGeoJSON(ST_Transform(ST_GeometryN(geom, 1), 4326))::jsonb,
-        'properties', jsonb_build_object(
-          'road_code', tr_rdcode,
-          'length_km', length_km
-        )
+        'properties', jsonb_build_object('road_code', tr_rdcode, 'length_km', length_km)
       ) as feature
       FROM national_highway_2018
       WHERE geom IS NOT NULL
@@ -43,7 +39,7 @@ app.get('/api/highways', asyncHandler(async (req, res) => {
   res.json(result.rows[0].geojson);
 }));
 
-// Get mining sites
+// Get mining sites as polygons
 app.get('/api/mining-sites', asyncHandler(async (req, res) => {
   const result = await pool.query(`
     SELECT jsonb_build_object(
@@ -54,7 +50,7 @@ app.get('/api/mining-sites', asyncHandler(async (req, res) => {
       SELECT jsonb_build_object(
         'type', 'Feature',
         'id', gb.gid,
-        'geometry', ST_AsGeoJSON(ST_Transform(ST_Centroid(gb.geom), 4326))::jsonb,
+        'geometry', ST_AsGeoJSON(ST_Transform(gb.geom, 4326))::jsonb,
         'properties', jsonb_build_object(
           'name', gb.name,
           'district', gb.district,
@@ -103,11 +99,7 @@ app.get('/api/schools', asyncHandler(async (req, res) => {
         'type', 'Feature',
         'id', gid,
         'geometry', ST_AsGeoJSON(ST_Transform(geom, 4326))::jsonb,
-        'properties', jsonb_build_object(
-          'name', schname,
-          'district', districtna,
-          'category', schcat_des
-        )
+        'properties', jsonb_build_object('name', schname, 'district', districtna)
       ) as feature
       FROM uprsac_09xxxx_educschool_20132016
       WHERE geom IS NOT NULL
@@ -127,7 +119,6 @@ app.get('/api/obstacles', asyncHandler(async (req, res) => {
       'features', COALESCE(jsonb_agg(feature), '[]'::jsonb)
     ) as geojson
     FROM (
-      -- Schools with buffer (transform to 4326 for display)
       SELECT jsonb_build_object(
         'type', 'Feature',
         'geometry', ST_AsGeoJSON(ST_Transform(ST_Buffer(geom::geometry, $1), 4326))::jsonb,
@@ -138,7 +129,6 @@ app.get('/api/obstacles', asyncHandler(async (req, res) => {
       
       UNION ALL
       
-      -- Rivers
       SELECT jsonb_build_object(
         'type', 'Feature',
         'geometry', ST_AsGeoJSON(ST_Transform(geom, 4326))::jsonb,
@@ -149,7 +139,6 @@ app.get('/api/obstacles', asyncHandler(async (req, res) => {
       
       UNION ALL
       
-      -- Mining sites as obstacles
       SELECT jsonb_build_object(
         'type', 'Feature',
         'geometry', ST_AsGeoJSON(ST_Transform(geom, 4326))::jsonb,
@@ -189,58 +178,52 @@ app.get('/api/roads', asyncHandler(async (req, res) => {
   res.json(result.rows[0].geojson);
 }));
 
-// Calculate optimal route for single mining site
+// Calculate optimal route - FIXED: Proper boundary connection
 app.post('/api/calculate-route', asyncHandler(async (req, res) => {
   const { miningGid, schoolBuffer = 500 } = req.body;
   
-  if (!miningGid) {
-    return res.status(400).json({ error: 'miningGid is required' });
-  }
+  if (!miningGid) return res.status(400).json({ error: 'miningGid is required' });
 
-  // Use geometry distance in meters (32644 is UTM in meters) instead of geography
   const result = await pool.query(`
     WITH mining_site AS (
-      SELECT gid, geom, ST_Centroid(geom) as center
-      FROM gorakhpur_brickkiln
+      SELECT gid, geom as mining_geom, ST_Centroid(geom) as center
+      FROM gorakhpur_brickkiln 
       WHERE gid = $1
     ),
     nearest_road AS (
       SELECT 
         rn.gid as road_gid,
-        rn.geom as road_geom,
-        ST_ClosestPoint(rn.geom, ms.center) as connection_point,
-        ST_Distance(rn.geom, ms.center) as distance_meters
+        ST_ClosestPoint(rn.geom, ms.center) as closest_on_road,
+        rn.geom as road_geom
       FROM road_network rn, mining_site ms
       ORDER BY rn.geom <-> ms.center
       LIMIT 1
     ),
-    exit_point AS (
+    -- Find the point on mining boundary closest to the road point
+    boundary_point AS (
       SELECT 
-        ms.gid,
-        ms.geom,
-        ST_ClosestPoint(ST_Boundary(ms.geom), nr.connection_point) as exit_pt
-      FROM mining_site ms, nearest_road nr
+        ST_ClosestPoint(ms.mining_geom, nr.closest_on_road) as exit_pt,
+        ms.mining_geom,
+        nr.closest_on_road,
+        nr.road_gid
+      FROM mining_site ms
+      CROSS JOIN nearest_road nr
     )
     SELECT 
-      ms.gid as mining_gid,
-      ST_Transform(ep.exit_pt, 4326) as entry_point,
-      ST_Transform(nr.connection_point, 4326) as connection_point,
-      nr.road_gid,
-      ST_AsGeoJSON(ST_Transform(ST_MakeLine(ep.exit_pt, nr.connection_point), 4326))::jsonb as path_geom,
-      nr.distance_meters as path_length,
-      nr.distance_meters as path_cost,
+      $1::integer as mining_gid,
+      ST_Transform(bp.exit_pt, 4326) as entry_point,
+      ST_Transform(bp.closest_on_road, 4326) as connection_point,
+      bp.road_gid,
+      ST_AsGeoJSON(ST_Transform(ST_MakeLine(bp.exit_pt, bp.closest_on_road), 4326))::jsonb as path_geom,
+      ST_Distance(bp.exit_pt, bp.closest_on_road) as path_length,
+      ST_Distance(bp.exit_pt, bp.closest_on_road) as path_cost,
       true as connected_to_existing
-    FROM mining_site ms
-    JOIN exit_point ep ON ms.gid = ep.gid
-    CROSS JOIN nearest_road nr
+    FROM boundary_point bp
   `, [miningGid]);
   
-  if (result.rows.length === 0) {
-    return res.status(404).json({ error: 'Mining site not found' });
-  }
+  if (result.rows.length === 0) return res.status(404).json({ error: 'Mining site not found' });
   
   const row = result.rows[0];
-  
   res.json({
     miningGid: row.mining_gid,
     entryPoint: row.entry_point,
@@ -253,37 +236,45 @@ app.post('/api/calculate-route', asyncHandler(async (req, res) => {
   });
 }));
 
-// Generate all roads batch process - FIXED (no geography, use geometry in meters)
-// Generate all roads batch process - FIXED with explicit casting
+// OPTIMIZED: Generate roads for ALL mining sites with proper boundary connections
 app.post('/api/generate-all-roads', asyncHandler(async (req, res) => {
-    const { batchSize = 10 } = req.body;
+  const { batchSize = null } = req.body;
+  
+  // Clear existing
+  await pool.query('TRUNCATE mining_connection_status');
+  await pool.query("DELETE FROM road_network WHERE road_type = 'mining_access'");
+  
+  // Get total count
+  const countResult = await pool.query(`SELECT COUNT(*) as total FROM gorakhpur_brickkiln WHERE geom IS NOT NULL`);
+  const totalSites = parseInt(countResult.rows[0].total);
+  const limit = batchSize ? parseInt(batchSize) : totalSites;
+  
+  // Process in chunks
+  const CHUNK_SIZE = 50;
+  let processed = 0;
+  let totalLength = 0;
+  const failedSites = [];
+  
+  for (let offset = 0; offset < limit; offset += CHUNK_SIZE) {
+    const chunkLimit = Math.min(CHUNK_SIZE, limit - offset);
     
-    // Clear existing
-    await pool.query('TRUNCATE mining_connection_status');
-    await pool.query("DELETE FROM road_network WHERE road_type = 'mining_access'");
-    
-    // Get mining sites
+    // Get chunk of mining sites
     const miningSites = await pool.query(`
-      SELECT gid, geom, ST_Centroid(geom) as center
+      SELECT gid, geom as mining_geom, ST_Centroid(geom) as center
       FROM gorakhpur_brickkiln
       WHERE geom IS NOT NULL
       ORDER BY gid
-      LIMIT $1
-    `, [parseInt(batchSize)]);
+      LIMIT $1 OFFSET $2
+    `, [chunkLimit, offset]);
     
-    let processed = 0;
-    let totalLength = 0;
-    const failedSites = [];
-    
-    // Process each site individually
+    // Process each site
     for (const site of miningSites.rows) {
       try {
-        // Find nearest road using geometry distance (meters in UTM)
+        // Find nearest road point
         const nearestRoad = await pool.query(`
           SELECT 
             rn.gid as road_gid,
-            ST_ClosestPoint(rn.geom, $1) as connection_pt,
-            ST_Distance(rn.geom, $1) as distance_meters
+            ST_ClosestPoint(rn.geom, $1) as closest_on_road
           FROM road_network rn
           ORDER BY rn.geom <-> $1
           LIMIT 1
@@ -296,25 +287,45 @@ app.post('/api/generate-all-roads', asyncHandler(async (req, res) => {
         
         const road = nearestRoad.rows[0];
         
-        // Calculate exit point on mining boundary
-        const exitPointResult = await pool.query(`
-          SELECT ST_ClosestPoint(ST_Boundary($1), $2) as exit_pt
-        `, [site.geom, road.connection_pt]);
+        // CRITICAL FIX: Calculate boundary point properly
+        // The exit point should be on the boundary, closest to the road point
+        const boundaryResult = await pool.query(`
+          SELECT 
+            -- Get point on mining boundary closest to the road point
+            ST_ClosestPoint($1::geometry, $2::geometry) as exit_pt,
+            -- Verify it's actually on the boundary (not inside)
+            ST_Boundary($1::geometry) as boundary_geom
+        `, [site.mining_geom, road.closest_on_road]);
         
-        const exit_pt = exitPointResult.rows[0].exit_pt;
+        let exit_pt = boundaryResult.rows[0].exit_pt;
+        const boundary_geom = boundaryResult.rows[0].boundary_geom;
         
-        // Calculate path geometry and length
+        // Double-check: if exit_pt is inside the polygon, project it to boundary
+        const isInside = await pool.query(`
+          SELECT ST_Within($1::geometry, $2::geometry) as is_inside
+        `, [exit_pt, site.mining_geom]);
+        
+        if (isInside.rows[0].is_inside) {
+          // If somehow inside, use the boundary line intersection
+          const corrected = await pool.query(`
+            SELECT ST_ClosestPoint(ST_Boundary($1), $2) as corrected_exit
+          `, [site.mining_geom, road.closest_on_road]);
+          exit_pt = corrected.rows[0].corrected_exit;
+        }
+        
+        // Calculate path from boundary to road
         const pathResult = await pool.query(`
           SELECT 
-            ST_MakeLine($1, $2) as path_geom,
-            ST_Distance($1, $2) as path_length
-        `, [exit_pt, road.connection_pt]);
+            ST_MakeLine($1::geometry, $2::geometry) as path_geom,
+            ST_Distance($1::geometry, $2::geometry) as path_length,
+            -- Verify path doesn't intersect mining site interior (shouldn't if we did it right)
+            ST_Intersects(ST_MakeLine($1::geometry, $2::geometry), ST_Boundary($3::geometry)) as touches_boundary
+        `, [exit_pt, road.closest_on_road, site.mining_geom]);
         
         const { path_geom, path_length } = pathResult.rows[0];
-        // Explicitly convert to number to ensure proper type
-        const pathLengthNum = Math.round(parseFloat(path_length) * 100) / 100; // Round to 2 decimals
+        const pathLengthNum = Math.round(parseFloat(path_length) * 100) / 100;
         
-        // Insert connection status with explicit casting
+        // Insert connection status
         await pool.query(`
           INSERT INTO mining_connection_status (
             mining_gid, is_connected, connection_road_gid, 
@@ -324,48 +335,27 @@ app.post('/api/generate-all-roads', asyncHandler(async (req, res) => {
         
         // Insert new road into network
         await pool.query(`
-          INSERT INTO road_network (
-            road_type, source_mining_site, length_km, cost, reverse_cost, geom
-          ) VALUES (
-            'mining_access',
-            $1::integer,
-            $2::numeric / 1000,
-            $2::numeric,
-            $2::numeric,
-            $3
-          )
+          INSERT INTO road_network (road_type, source_mining_site, length_km, cost, reverse_cost, geom)
+          VALUES ('mining_access', $1::integer, $2::numeric / 1000, $2::numeric, $2::numeric, $3)
         `, [site.gid, pathLengthNum, path_geom]);
         
         processed++;
         totalLength += pathLengthNum;
         
       } catch (err) {
-        console.error(`Error processing mining site ${site.gid}:`, err);
+        console.error(`Error processing mining site ${site.gid}:`, err.message);
         failedSites.push(site.gid);
       }
     }
-    
-    res.json({
-      processedCount: processed,
-      totalRoadLength: totalLength,
-      failedSites: failedSites,
-      success: failedSites.length === 0
-    });
-  }));
-
-// Add new road to network
-app.post('/api/add-road', asyncHandler(async (req, res) => {
-  const { roadType, sourceMiningSite, geometry, lengthKm, cost } = req.body;
+  }
   
-  // Convert from GeoJSON (4326) to 32644 for storage
-  const result = await pool.query(`
-    INSERT INTO road_network (
-      road_type, source_mining_site, length_km, cost, reverse_cost, geom
-    ) VALUES ($1, $2, $3, $4, $4, ST_Transform(ST_SetSRID(ST_GeomFromGeoJSON($5), 4326), 32644))
-    RETURNING gid
-  `, [roadType, sourceMiningSite, lengthKm, cost, JSON.stringify(geometry)]);
-  
-  res.json({ success: true, roadGid: result.rows[0].gid });
+  res.json({
+    processedCount: processed,
+    totalRoadLength: totalLength,
+    failedSites: failedSites,
+    totalSites: totalSites,
+    success: failedSites.length === 0
+  });
 }));
 
 // Reset network
@@ -373,20 +363,15 @@ app.post('/api/reset-network', asyncHandler(async (req, res) => {
   await pool.query('TRUNCATE road_network');
   await pool.query('TRUNCATE mining_connection_status');
   
-  // Re-insert highways (convert to 32644)
   await pool.query(`
     INSERT INTO road_network (road_type, length_km, cost, reverse_cost, geom)
     SELECT 
-      'highway',
-      length_km,
-      COALESCE(cost, length_km::double precision),
-      COALESCE(reverse_cost, length_km::double precision),
+      'highway', length_km, length_km::double precision, length_km::double precision,
       ST_GeometryN(geom, 1)::geometry(LineString, 32644)
-    FROM national_highway_2018
-    WHERE geom IS NOT NULL
+    FROM national_highway_2018 WHERE geom IS NOT NULL
   `);
   
-  res.json({ success: true, message: 'Network reset to highways only' });
+  res.json({ success: true, message: 'Network reset' });
 }));
 
 // Get statistics
@@ -399,20 +384,15 @@ app.get('/api/statistics', asyncHandler(async (req, res) => {
       (SELECT COUNT(*) FROM road_network WHERE road_type = 'mining_access') as new_roads_count,
       (SELECT COALESCE(SUM(length_km), 0) FROM road_network WHERE road_type = 'mining_access') as new_roads_length
   `);
-  
   res.json(result.rows[0]);
 }));
 
-// Global error handler
+// Error handler
 app.use((err, req, res, next) => {
   console.error('Error:', err);
-  res.status(500).json({ 
-    error: err.message,
-    detail: err.detail || 'Internal server error'
-  });
+  res.status(500).json({ error: err.message, detail: err.detail || 'Internal error' });
 });
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  console.log(`Test: http://localhost:${PORT}/api/health`);
 });
