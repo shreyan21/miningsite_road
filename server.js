@@ -112,7 +112,7 @@ app.get('/api/schools', asyncHandler(async (req, res) => {
 app.get('/api/obstacles', asyncHandler(async (req, res) => {
   const { schoolBuffer = 500 } = req.query;
   const bufferDist = parseFloat(schoolBuffer);
-  
+
   const result = await pool.query(`
     SELECT jsonb_build_object(
       'type', 'FeatureCollection',
@@ -148,7 +148,7 @@ app.get('/api/obstacles', asyncHandler(async (req, res) => {
       WHERE geom IS NOT NULL
     ) features
   `, [bufferDist]);
-  
+
   res.json(result.rows[0].geojson);
 }));
 
@@ -181,7 +181,7 @@ app.get('/api/roads', asyncHandler(async (req, res) => {
 // Calculate optimal route - FIXED: Proper boundary connection
 app.post('/api/calculate-route', asyncHandler(async (req, res) => {
   const { miningGid, schoolBuffer = 500 } = req.body;
-  
+
   if (!miningGid) return res.status(400).json({ error: 'miningGid is required' });
 
   const result = await pool.query(`
@@ -220,9 +220,9 @@ app.post('/api/calculate-route', asyncHandler(async (req, res) => {
       true as connected_to_existing
     FROM boundary_point bp
   `, [miningGid]);
-  
+
   if (result.rows.length === 0) return res.status(404).json({ error: 'Mining site not found' });
-  
+
   const row = result.rows[0];
   res.json({
     miningGid: row.mining_gid,
@@ -239,25 +239,25 @@ app.post('/api/calculate-route', asyncHandler(async (req, res) => {
 // OPTIMIZED: Generate roads for ALL mining sites with proper boundary connections
 app.post('/api/generate-all-roads', asyncHandler(async (req, res) => {
   const { batchSize = null } = req.body;
-  
+
   // Clear existing
   await pool.query('TRUNCATE mining_connection_status');
   await pool.query("DELETE FROM road_network WHERE road_type = 'mining_access'");
-  
+
   // Get total count
   const countResult = await pool.query(`SELECT COUNT(*) as total FROM gorakhpur_brickkiln WHERE geom IS NOT NULL`);
   const totalSites = parseInt(countResult.rows[0].total);
   const limit = batchSize ? parseInt(batchSize) : totalSites;
-  
+
   // Process in chunks
   const CHUNK_SIZE = 50;
   let processed = 0;
   let totalLength = 0;
   const failedSites = [];
-  
+
   for (let offset = 0; offset < limit; offset += CHUNK_SIZE) {
     const chunkLimit = Math.min(CHUNK_SIZE, limit - offset);
-    
+
     // Get chunk of mining sites
     const miningSites = await pool.query(`
       SELECT gid, geom as mining_geom, ST_Centroid(geom) as center
@@ -266,7 +266,7 @@ app.post('/api/generate-all-roads', asyncHandler(async (req, res) => {
       ORDER BY gid
       LIMIT $1 OFFSET $2
     `, [chunkLimit, offset]);
-    
+
     // Process each site
     for (const site of miningSites.rows) {
       try {
@@ -279,14 +279,14 @@ app.post('/api/generate-all-roads', asyncHandler(async (req, res) => {
           ORDER BY rn.geom <-> $1
           LIMIT 1
         `, [site.center]);
-        
+
         if (nearestRoad.rows.length === 0) {
           failedSites.push(site.gid);
           continue;
         }
-        
+
         const road = nearestRoad.rows[0];
-        
+
         // CRITICAL FIX: Calculate boundary point properly
         // The exit point should be on the boundary, closest to the road point
         const boundaryResult = await pool.query(`
@@ -296,15 +296,15 @@ app.post('/api/generate-all-roads', asyncHandler(async (req, res) => {
             -- Verify it's actually on the boundary (not inside)
             ST_Boundary($1::geometry) as boundary_geom
         `, [site.mining_geom, road.closest_on_road]);
-        
+
         let exit_pt = boundaryResult.rows[0].exit_pt;
         const boundary_geom = boundaryResult.rows[0].boundary_geom;
-        
+
         // Double-check: if exit_pt is inside the polygon, project it to boundary
         const isInside = await pool.query(`
           SELECT ST_Within($1::geometry, $2::geometry) as is_inside
         `, [exit_pt, site.mining_geom]);
-        
+
         if (isInside.rows[0].is_inside) {
           // If somehow inside, use the boundary line intersection
           const corrected = await pool.query(`
@@ -312,7 +312,7 @@ app.post('/api/generate-all-roads', asyncHandler(async (req, res) => {
           `, [site.mining_geom, road.closest_on_road]);
           exit_pt = corrected.rows[0].corrected_exit;
         }
-        
+
         // Calculate path from boundary to road
         const pathResult = await pool.query(`
           SELECT 
@@ -321,10 +321,10 @@ app.post('/api/generate-all-roads', asyncHandler(async (req, res) => {
             -- Verify path doesn't intersect mining site interior (shouldn't if we did it right)
             ST_Intersects(ST_MakeLine($1::geometry, $2::geometry), ST_Boundary($3::geometry)) as touches_boundary
         `, [exit_pt, road.closest_on_road, site.mining_geom]);
-        
+
         const { path_geom, path_length } = pathResult.rows[0];
         const pathLengthNum = Math.round(parseFloat(path_length) * 100) / 100;
-        
+
         // Insert connection status
         await pool.query(`
           INSERT INTO mining_connection_status (
@@ -332,23 +332,23 @@ app.post('/api/generate-all-roads', asyncHandler(async (req, res) => {
             connection_cost, connected_at, entry_point_geom, path_length
           ) VALUES ($1::integer, true, $2::integer, $3::numeric, NOW(), $4, $5::numeric)
         `, [site.gid, road.road_gid, pathLengthNum, exit_pt, pathLengthNum]);
-        
+
         // Insert new road into network
         await pool.query(`
           INSERT INTO road_network (road_type, source_mining_site, length_km, cost, reverse_cost, geom)
           VALUES ('mining_access', $1::integer, $2::numeric / 1000, $2::numeric, $2::numeric, $3)
         `, [site.gid, pathLengthNum, path_geom]);
-        
+
         processed++;
         totalLength += pathLengthNum;
-        
+
       } catch (err) {
         console.error(`Error processing mining site ${site.gid}:`, err.message);
         failedSites.push(site.gid);
       }
     }
   }
-  
+
   res.json({
     processedCount: processed,
     totalRoadLength: totalLength,
@@ -362,7 +362,7 @@ app.post('/api/generate-all-roads', asyncHandler(async (req, res) => {
 app.post('/api/reset-network', asyncHandler(async (req, res) => {
   await pool.query('TRUNCATE road_network');
   await pool.query('TRUNCATE mining_connection_status');
-  
+
   await pool.query(`
     INSERT INTO road_network (road_type, length_km, cost, reverse_cost, geom)
     SELECT 
@@ -370,7 +370,7 @@ app.post('/api/reset-network', asyncHandler(async (req, res) => {
       ST_GeometryN(geom, 1)::geometry(LineString, 32644)
     FROM national_highway_2018 WHERE geom IS NOT NULL
   `);
-  
+
   res.json({ success: true, message: 'Network reset' });
 }));
 
