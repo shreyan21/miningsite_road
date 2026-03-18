@@ -40,7 +40,7 @@ app.get('/api/health', asyncHandler(async (req, res) => {
     status: 'OK', 
     timestamp: result.rows[0].now,
     schoolTables: SCHOOL_TABLES.map(t => t.table),
-    version: '2.7-knn-fixed'
+    version: '3.0-river-bypass-complete'
   });
 }));
 
@@ -136,7 +136,7 @@ app.get('/api/rivers', asyncHandler(async (req, res) => {
   res.json(result.rows[0].geojson);
 }));
 
-// Get schools - FIXED to handle schoolType parameter with proper column names
+// Get schools - FIXED for gorakhpur_ps with proper column handling
 app.get('/api/schools', asyncHandler(async (req, res) => {
   const { schoolType } = req.query;
 
@@ -253,7 +253,7 @@ app.get('/api/obstacles', asyncHandler(async (req, res) => {
 
       UNION ALL
 
-      -- Rivers
+      -- Rivers (for visualization only - roads bypass them)
       SELECT jsonb_build_object(
         'type', 'Feature',
         'geometry', ST_AsGeoJSON(ST_Transform(ST_Force2D(geom), 4326))::jsonb,
@@ -295,7 +295,8 @@ app.get('/api/roads', asyncHandler(async (req, res) => {
           'length_km', length_km,
           'cost', cost,
           'source_mining', source_mining_site,
-          'is_curved', COALESCE(is_curved, false)
+          'is_curved', COALESCE(is_curved, false),
+          'is_bypass', COALESCE(is_bypass, false)
         )
       ) as feature
       FROM road_network
@@ -363,7 +364,7 @@ app.post('/api/job-cancel/:jobId', asyncHandler(async (req, res) => {
 }));
 
 // =====================================================
-// FIXED: Async processing with proper KNN operator usage
+// RIVER BYPASS: Async processing with river avoidance
 // =====================================================
 async function processRoadsAsync(jobId, batchSize, schoolBuffer) {
   const status = processingStatus.get(jobId);
@@ -381,7 +382,7 @@ async function processRoadsAsync(jobId, batchSize, schoolBuffer) {
 
     status.total = limit;
     status.status = 'processing';
-    status.message = `Processing ${limit} sites...`;
+    status.message = `Processing ${limit} sites with river bypass...`;
 
     const CHUNK_SIZE = 5;
     let processed = 0;
@@ -414,7 +415,7 @@ async function processRoadsAsync(jobId, batchSize, schoolBuffer) {
             return;
           }
 
-          // Get obstacles - using explicit geometry casting
+          // Get obstacles (schools and mining sites - NOT rivers, rivers are bypassed)
           const obstaclesResult = await client.query(`
             WITH mining_obstacles AS (
               SELECT ST_Union(ST_Force2D(geom)) as geom
@@ -437,6 +438,14 @@ async function processRoadsAsync(jobId, batchSize, schoolBuffer) {
           `, [site.gid, schoolBuffer]);
 
           const allObstacles = obstaclesResult.rows[0]?.all_obstacles;
+
+          // Get rivers for bypass detection
+          const riversResult = await client.query(`
+            SELECT ST_Union(ST_Force2D(geom)) as river_geom
+            FROM uprsac_09xxxx_riverxxxxx_09042018
+            WHERE geom IS NOT NULL
+          `);
+          const riverGeom = riversResult.rows[0]?.river_geom;
 
           // Get boundary points
           const boundaryPointsResult = await client.query(`
@@ -477,8 +486,7 @@ async function processRoadsAsync(jobId, batchSize, schoolBuffer) {
           let bestConnection = null;
           let bestCost = Infinity;
 
-          // FIXED: Use proper geometry casting for KNN operator
-          // The <-> operator needs both sides to be geometry types
+          // Find nearest roads using KNN with proper geometry casting
           const nearbyRoads = await client.query(`
             SELECT 
               rn.gid as road_gid,
@@ -487,13 +495,15 @@ async function processRoadsAsync(jobId, batchSize, schoolBuffer) {
             FROM road_network rn
             WHERE rn.geom IS NOT NULL
             ORDER BY rn.geom::geometry <-> $1::geometry
-            LIMIT 3
+            LIMIT 5
           `, [site.center]);
 
-          // Try straight connections first
-          for (const road of nearbyRoads.rows) {
-            for (const exitPt of boundaryPoints) {
-              const pathCheck = await client.query(`
+          // Try each boundary point and road combination
+          for (const exitPt of boundaryPoints) {
+            for (const road of nearbyRoads.rows) {
+
+              // Check if straight path crosses river or obstacles
+              const riverCheck = await client.query(`
                 SELECT 
                   ST_MakeLine($1::geometry, $2::geometry) as path_geom,
                   ST_Distance($1::geometry, $2::geometry) as path_length,
@@ -501,92 +511,63 @@ async function processRoadsAsync(jobId, batchSize, schoolBuffer) {
                   CASE 
                     WHEN $4::geometry IS NULL OR ST_IsEmpty($4::geometry) THEN false
                     ELSE ST_Crosses(ST_MakeLine($1::geometry, $2::geometry), $4::geometry)
-                  END as crosses_obstacles
-              `, [exitPt, road.road_point, site.mining_geom, allObstacles]);
+                  END as crosses_obstacles,
+                  CASE 
+                    WHEN $5::geometry IS NULL OR ST_IsEmpty($5::geometry) THEN false
+                    ELSE ST_Crosses(ST_MakeLine($1::geometry, $2::geometry), $5::geometry)
+                  END as crosses_river
+              `, [exitPt, road.road_point, site.mining_geom, allObstacles, riverGeom]);
 
-              const check = pathCheck.rows[0];
+              const check = riverCheck.rows[0];
               const pathLength = parseFloat(check.path_length);
 
+              // Skip if crosses own site or obstacles
               if (check.crosses_own_site || check.crosses_obstacles) {
                 continue;
               }
 
-              if (pathLength < bestCost) {
-                bestCost = pathLength;
-                bestConnection = {
-                  roadGid: parseInt(road.road_gid),
-                  exitPt: exitPt,
-                  roadPoint: road.road_point,
-                  pathGeom: check.path_geom,
-                  pathLength: pathLength,
-                  isCurved: false
-                };
-              }
-            }
-          }
+              // If crosses river, try to find bypass
+              if (check.crosses_river) {
+                const bypassResult = await findRiverBypass(client, exitPt, road.road_point, riverGeom, site.mining_geom, allObstacles);
 
-          // Try curved/angled paths if no straight path found
-          if (!bestConnection && boundaryPoints.length >= 2) {
-            for (let i = 0; i < Math.min(boundaryPoints.length, 6) && !bestConnection; i++) {
-              for (let j = i + 1; j < Math.min(boundaryPoints.length, 6); j++) {
-                const pt1 = boundaryPoints[i];
-                const pt2 = boundaryPoints[j];
-
-                // FIXED: KNN with proper geometry casting
-                const roadRes = await client.query(`
-                  SELECT ST_ClosestPoint(rn.geom::geometry, $1::geometry) as road_pt
-                  FROM road_network rn
-                  WHERE rn.geom IS NOT NULL
-                  ORDER BY rn.geom::geometry <-> $1::geometry
-                  LIMIT 1
-                `, [pt2]);
-
-                if (roadRes.rows.length === 0) continue;
-                const roadPt = roadRes.rows[0].road_pt;
-
-                const curvedCheck = await client.query(`
-                  SELECT 
-                    ST_MakeLine(ARRAY[$1::geometry, $2::geometry, $3::geometry]) as path_geom,
-                    ST_Length(ST_MakeLine(ARRAY[$1::geometry, $2::geometry, $3::geometry])) as path_length,
-                    ST_Crosses(ST_MakeLine($1::geometry, $2::geometry), $4::geometry) as seg1_crosses_own,
-                    ST_Crosses(ST_MakeLine($2::geometry, $3::geometry), $4::geometry) as seg2_crosses_own,
-                    CASE 
-                      WHEN $5::geometry IS NULL OR ST_IsEmpty($5::geometry) THEN false
-                      ELSE ST_Crosses(ST_MakeLine($1::geometry, $2::geometry), $5::geometry) OR
-                           ST_Crosses(ST_MakeLine($2::geometry, $3::geometry), $5::geometry)
-                    END as crosses_obstacles
-                `, [pt1, pt2, roadPt, site.mining_geom, allObstacles]);
-
-                const curved = curvedCheck.rows[0];
-                if (curved && !curved.seg1_crosses_own && !curved.seg2_crosses_own && !curved.crosses_obstacles) {
-                  const pathLength = parseFloat(curved.path_length);
-                  if (pathLength < bestCost) {
-                    // FIXED: KNN lookup with proper casting
-                    const roadGidRes = await client.query(`
-                      SELECT gid FROM road_network rn
-                      WHERE rn.geom IS NOT NULL
-                      ORDER BY rn.geom::geometry <-> $1::geometry 
-                      LIMIT 1
-                    `, [pt2]);
-
-                    bestCost = pathLength;
-                    bestConnection = {
-                      roadGid: parseInt(roadGidRes.rows[0]?.gid) || 1,
-                      exitPt: pt1,
-                      roadPoint: pt2,
-                      pathGeom: curved.path_geom,
-                      pathLength: pathLength,
-                      isCurved: true
-                    };
-                  }
+                if (bypassResult && bypassResult.pathLength < bestCost) {
+                  bestCost = bypassResult.pathLength;
+                  bestConnection = {
+                    roadGid: parseInt(road.road_gid),
+                    exitPt: exitPt,
+                    roadPoint: bypassResult.roadPoint,
+                    pathGeom: bypassResult.pathGeom,
+                    pathLength: bypassResult.pathLength,
+                    isCurved: true,
+                    isBypass: true
+                  };
+                }
+              } else {
+                // No river crossing - use straight path
+                if (pathLength < bestCost) {
+                  bestCost = pathLength;
+                  bestConnection = {
+                    roadGid: parseInt(road.road_gid),
+                    exitPt: exitPt,
+                    roadPoint: road.road_point,
+                    pathGeom: check.path_geom,
+                    pathLength: pathLength,
+                    isCurved: false,
+                    isBypass: false
+                  };
                 }
               }
             }
           }
 
+          // If no connection found, try curved paths without river
+          if (!bestConnection) {
+            bestConnection = await tryCurvedBypass(client, boundaryPoints, nearbyRoads.rows, site.mining_geom, allObstacles, riverGeom);
+          }
+
           if (!bestConnection) {
             failedSites.push(site.gid);
-            failedDetails.push({ gid: site.gid, reason: 'No valid path found (obstacles block all routes)' });
+            failedDetails.push({ gid: site.gid, reason: 'No valid path found (river blocks all routes)' });
           } else {
             const pathLengthNum = Math.round(bestConnection.pathLength * 100) / 100;
             const siteGid = parseInt(site.gid);
@@ -599,16 +580,16 @@ async function processRoadsAsync(jobId, batchSize, schoolBuffer) {
             await client.query(`
               INSERT INTO mining_connection_status (
                 mining_gid, is_connected, connection_road_gid, 
-                connection_cost, connected_at, entry_point_geom, path_length, is_curved
+                connection_cost, connected_at, entry_point_geom, path_length, is_curved, is_bypass
               ) VALUES ($1::integer, true, $2::integer, $3::numeric, NOW(), 
-                        ST_Force2D($4::geometry), $5::numeric, $6::boolean)
+                        ST_Force2D($4::geometry), $5::numeric, $6::boolean, $7::boolean)
             `, [siteGid, roadGid, pathLengthNum, 
-                bestConnection.exitPt, pathLengthNum, bestConnection.isCurved]);
+                bestConnection.exitPt, pathLengthNum, bestConnection.isCurved, bestConnection.isBypass]);
 
             await client.query(`
-              INSERT INTO road_network (road_type, source_mining_site, length_km, cost, reverse_cost, geom, is_curved)
-              VALUES ('mining_access', $1::integer, $2::numeric / 1000, $2::numeric, $2::numeric, $3, $4::boolean)
-            `, [siteGid, pathLengthNum, path2D.rows[0].geom_2d, bestConnection.isCurved]);
+              INSERT INTO road_network (road_type, source_mining_site, length_km, cost, reverse_cost, geom, is_curved, is_bypass)
+              VALUES ('mining_access', $1::integer, $2::numeric / 1000, $2::numeric, $2::numeric, $3, $4::boolean, $5::boolean)
+            `, [siteGid, pathLengthNum, path2D.rows[0].geom_2d, bestConnection.isCurved, bestConnection.isBypass]);
 
             processed++;
             totalLength += pathLengthNum;
@@ -656,6 +637,214 @@ async function processRoadsAsync(jobId, batchSize, schoolBuffer) {
   }
 }
 
+// Helper function: Find river bypass path
+async function findRiverBypass(client, startPt, endPt, riverGeom, siteGeom, obstacles) {
+  try {
+    // Strategy: Find points along the river boundary that can be used as waypoints
+    // The road will go from start -> river edge -> around river -> river edge -> end
+
+    // Get intersection point of direct line with river
+    const intersectResult = await client.query(`
+      SELECT ST_Intersection(ST_MakeLine($1::geometry, $2::geometry), $3::geometry) as intersect_geom
+    `, [startPt, endPt, riverGeom]);
+
+    if (!intersectResult.rows[0]?.intersect_geom) {
+      return null;
+    }
+
+    // Find the nearest point on river boundary from start
+    const riverEdgeStart = await client.query(`
+      SELECT 
+        ST_ClosestPoint($2::geometry, $1::geometry) as edge_point,
+        ST_Distance($1::geometry, ST_ClosestPoint($2::geometry, $1::geometry)) as dist
+      FROM (SELECT $1::geometry as pt) t
+    `, [startPt, riverGeom]);
+
+    // Find the nearest point on river boundary from end
+    const riverEdgeEnd = await client.query(`
+      SELECT 
+        ST_ClosestPoint($2::geometry, $1::geometry) as edge_point,
+        ST_Distance($1::geometry, ST_ClosestPoint($2::geometry, $1::geometry)) as dist
+      FROM (SELECT $1::geometry as pt) t
+    `, [endPt, riverGeom]);
+
+    const edgeStart = riverEdgeStart.rows[0]?.edge_point;
+    const edgeEnd = riverEdgeEnd.rows[0]?.edge_point;
+
+    if (!edgeStart || !edgeEnd) {
+      return null;
+    }
+
+    // Try different bypass distances
+    const bypassDistances = [100, 200, 300, 500, 800, 1000]; // meters
+
+    for (const bypassDist of bypassDistances) {
+      // Create bypass points perpendicular to the river
+      const bypassResult = await client.query(`
+        WITH line AS (
+          SELECT ST_MakeLine($1::geometry, $2::geometry) as direct_line
+        ),
+        perp_direction AS (
+          SELECT 
+            ST_Azimuth($1::geometry, $2::geometry) + PI()/2 as perp_azimuth
+        ),
+        bypass_points AS (
+          SELECT 
+            ST_Project($1::geometry, $3, perp_azimuth)::geometry as bypass_start,
+            ST_Project($2::geometry, $3, perp_azimuth)::geometry as bypass_end
+          FROM perp_direction
+        )
+        SELECT 
+          bypass_start,
+          bypass_end,
+          ST_MakeLine(ARRAY[$1::geometry, bypass_start, bypass_end, $2::geometry]) as bypass_path,
+          ST_Length(ST_MakeLine(ARRAY[$1::geometry, bypass_start, bypass_end, $2::geometry])) as bypass_length,
+          ST_Crosses(ST_MakeLine($1::geometry, bypass_start), $4::geometry) as crosses_river1,
+          ST_Crosses(ST_MakeLine(bypass_start, bypass_end), $4::geometry) as crosses_river2,
+          ST_Crosses(ST_MakeLine(bypass_end, $2::geometry), $4::geometry) as crosses_river3,
+          ST_Crosses(ST_MakeLine(ARRAY[$1::geometry, bypass_start, bypass_end, $2::geometry]), $5::geometry) as crosses_site,
+          CASE 
+            WHEN $6::geometry IS NULL OR ST_IsEmpty($6::geometry) THEN false
+            ELSE ST_Crosses(ST_MakeLine(ARRAY[$1::geometry, bypass_start, bypass_end, $2::geometry]), $6::geometry)
+          END as crosses_obstacles
+        FROM bypass_points
+      `, [startPt, endPt, bypassDist, riverGeom, siteGeom, obstacles]);
+
+      const bypass = bypassResult.rows[0];
+
+      // Check if this bypass avoids the river and obstacles
+      if (bypass && 
+          !bypass.crosses_river2 && // Middle segment should not cross river
+          !bypass.crosses_site && 
+          !bypass.crosses_obstacles) {
+        return {
+          pathGeom: bypass.bypass_path,
+          pathLength: parseFloat(bypass.bypass_length),
+          roadPoint: endPt,
+          isBypass: true
+        };
+      }
+    }
+
+    // If perpendicular bypass didn't work, try going around the river ends
+    // Find river extent and go around it
+    const riverExtent = await client.query(`
+      SELECT 
+        ST_XMin($1::geometry) as xmin,
+        ST_YMin($1::geometry) as ymin,
+        ST_XMax($1::geometry) as xmax,
+        ST_YMax($1::geometry) as ymax,
+        ST_Centroid($1::geometry) as center
+    `, [riverGeom]);
+
+    const extent = riverExtent.rows[0];
+    if (!extent) return null;
+
+    // Try going around left/right of river
+    const aroundDistances = [200, 400, 600, 1000];
+
+    for (const aroundDist of aroundDistances) {
+      // Try going around on one side
+      const aroundResult = await client.query(`
+        WITH start_pt AS (SELECT $1::geometry as geom),
+        end_pt AS (SELECT $2::geometry as geom),
+        river_center AS (SELECT $3::geometry as geom)
+        SELECT 
+          ST_MakeLine(ARRAY[
+            $1::geometry,
+            ST_SetSRID(ST_MakePoint(ST_X($1::geometry) - $4, ST_Y($1::geometry)), ST_SRID($1::geometry)),
+            ST_SetSRID(ST_MakePoint(ST_X($2::geometry) - $4, ST_Y($2::geometry)), ST_SRID($2::geometry)),
+            $2::geometry
+          ]) as around_path,
+          ST_Length(ST_MakeLine(ARRAY[
+            $1::geometry,
+            ST_SetSRID(ST_MakePoint(ST_X($1::geometry) - $4, ST_Y($1::geometry)), ST_SRID($1::geometry)),
+            ST_SetSRID(ST_MakePoint(ST_X($2::geometry) - $4, ST_Y($2::geometry)), ST_SRID($2::geometry)),
+            $2::geometry
+          ])) as around_length,
+          ST_Crosses(ST_MakeLine(ARRAY[
+            $1::geometry,
+            ST_SetSRID(ST_MakePoint(ST_X($1::geometry) - $4, ST_Y($1::geometry)), ST_SRID($1::geometry)),
+            ST_SetSRID(ST_MakePoint(ST_X($2::geometry) - $4, ST_Y($2::geometry)), ST_SRID($2::geometry)),
+            $2::geometry
+          ]), $5::geometry) as crosses_river
+        FROM start_pt, end_pt, river_center
+      `, [startPt, endPt, extent.center, aroundDist, riverGeom]);
+
+      const around = aroundResult.rows[0];
+      if (around && !around.crosses_river) {
+        return {
+          pathGeom: around.around_path,
+          pathLength: parseFloat(around.around_length),
+          roadPoint: endPt,
+          isBypass: true
+        };
+      }
+    }
+
+    return null;
+  } catch (err) {
+    console.error('Error in findRiverBypass:', err.message);
+    return null;
+  }
+}
+
+// Helper function: Try curved bypass when straight paths fail
+async function tryCurvedBypass(client, boundaryPoints, nearbyRoads, siteGeom, obstacles, riverGeom) {
+  let bestConnection = null;
+  let bestCost = Infinity;
+
+  // Try combinations of boundary points to create curved paths
+  for (let i = 0; i < Math.min(boundaryPoints.length, 6); i++) {
+    for (let j = i + 1; j < Math.min(boundaryPoints.length, 6); j++) {
+      const pt1 = boundaryPoints[i];
+      const pt2 = boundaryPoints[j];
+
+      for (const road of nearbyRoads) {
+        // Create curved path through intermediate point
+        const curvedCheck = await client.query(`
+          SELECT 
+            ST_MakeLine(ARRAY[$1::geometry, $2::geometry, $3::geometry]) as path_geom,
+            ST_Length(ST_MakeLine(ARRAY[$1::geometry, $2::geometry, $3::geometry])) as path_length,
+            ST_Crosses(ST_MakeLine($1::geometry, $2::geometry), $4::geometry) as seg1_crosses_own,
+            ST_Crosses(ST_MakeLine($2::geometry, $3::geometry), $4::geometry) as seg2_crosses_own,
+            CASE 
+              WHEN $5::geometry IS NULL OR ST_IsEmpty($5::geometry) THEN false
+              ELSE ST_Crosses(ST_MakeLine(ARRAY[$1::geometry, $2::geometry, $3::geometry]), $5::geometry)
+            END as crosses_obstacles,
+            CASE 
+              WHEN $6::geometry IS NULL OR ST_IsEmpty($6::geometry) THEN false
+              ELSE ST_Crosses(ST_MakeLine(ARRAY[$1::geometry, $2::geometry, $3::geometry]), $6::geometry)
+            END as crosses_river
+        `, [pt1, pt2, road.road_point, siteGeom, obstacles, riverGeom]);
+
+        const curved = curvedCheck.rows[0];
+        if (curved && 
+            !curved.seg1_crosses_own && 
+            !curved.seg2_crosses_own && 
+            !curved.crosses_obstacles &&
+            !curved.crosses_river) {
+          const pathLength = parseFloat(curved.path_length);
+          if (pathLength < bestCost) {
+            bestCost = pathLength;
+            bestConnection = {
+              roadGid: parseInt(road.road_gid),
+              exitPt: pt1,
+              roadPoint: pt2,
+              pathGeom: curved.path_geom,
+              pathLength: pathLength,
+              isCurved: true,
+              isBypass: true
+            };
+          }
+        }
+      }
+    }
+  }
+
+  return bestConnection;
+}
+
 // Reset network
 app.post('/api/reset-network', asyncHandler(async (req, res) => {
   const client = await pool.connect();
@@ -665,10 +854,10 @@ app.post('/api/reset-network', asyncHandler(async (req, res) => {
     await client.query('TRUNCATE mining_connection_status');
 
     await client.query(`
-      INSERT INTO road_network (road_type, length_km, cost, reverse_cost, geom)
+      INSERT INTO road_network (road_type, length_km, cost, reverse_cost, geom, is_curved, is_bypass)
       SELECT 
         'highway', length_km, length_km::double precision, length_km::double precision,
-        ST_Force2D(ST_GeometryN(geom, 1))::geometry(LineString, 32644)
+        ST_Force2D(ST_GeometryN(geom, 1))::geometry(LineString, 32644), false, false
       FROM national_highway_2018 WHERE geom IS NOT NULL
     `);
 
@@ -691,7 +880,8 @@ app.get('/api/statistics', asyncHandler(async (req, res) => {
       (SELECT COALESCE(SUM(path_length), 0) FROM mining_connection_status WHERE is_connected) as total_road_length,
       (SELECT COUNT(*) FROM road_network WHERE road_type = 'mining_access') as new_roads_count,
       (SELECT COALESCE(SUM(length_km), 0) FROM road_network WHERE road_type = 'mining_access') as new_roads_length,
-      (SELECT COUNT(*) FROM mining_connection_status WHERE is_curved = true) as curved_roads_count
+      (SELECT COUNT(*) FROM mining_connection_status WHERE is_curved = true) as curved_roads_count,
+      (SELECT COUNT(*) FROM mining_connection_status WHERE is_bypass = true) as bypass_roads_count
   `);
   res.json(result.rows[0]);
 }));
@@ -704,9 +894,9 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  console.log(`KNN-FIXED Multi-school obstacle avoidance enabled`);
-  console.log(`Configured school tables: ${SCHOOL_TABLES.map(t => t.table).join(', ')}`);
+  console.log(`River Bypass Mode: Roads go AROUND rivers, not across`);
+  console.log(`Debug endpoint: GET /api/debug/gorakhpur-ps`);
   console.log(`Submit job: POST /api/generate-all-roads`);
   console.log(`Check status: GET /api/job-status/:jobId`);
-  console.log(`Fixed: Proper geometry casting for KNN operator <->`);
+  console.log(`Version: 3.0 - KNN optimized with river bypass`);
 });
