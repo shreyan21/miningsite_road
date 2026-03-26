@@ -122,10 +122,12 @@ app.post('/api/generate-all-roads', asyncHandler(async (req, res) => {
     ? null
     : Number(req.body.batchSize);
   const schoolBuffer = parsePositiveNumber(req.body.schoolBuffer, 500);
+  const appendMode = req.body.appendMode !== false;
 
   const summary = await generateRoutesForMiningSites(pool, {
     batchSize: Number.isInteger(batchSize) && batchSize > 0 ? batchSize : null,
     schoolBuffer,
+    appendMode,
   });
 
   res.json(summary);

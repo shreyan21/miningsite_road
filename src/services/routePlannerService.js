@@ -2,14 +2,20 @@ import { SCHOOL_SOURCES, TABLES } from '../config/datasets.js';
 import { qualifiedTable, quoteIdentifier, tableExists } from '../utils/sql.js';
 import { reseedBaseRoadNetwork } from './bootstrap.js';
 
-const CANDIDATE_LIMIT = 10;
-const MAX_DETOUR_DEPTH = 4;
+const CANDIDATE_LIMIT = 14;
+const CANDIDATE_LIMIT_STEPS = [14, 40, 80, 140];
+const MAX_DETOUR_DEPTH = 6;
 const DETOUR_CLEARANCE = 30;
 const PLANNER_MODE = 'obstacle_aware_polyline';
 const TEMP_OBSTACLE_CACHE = 'temp_route_obstacle_cache';
+const BASE_ROAD_SHARE = 0.65;
 
 const pointWkt = ([x, y]) => `POINT(${x} ${y})`;
 const lineWkt = (points) => `LINESTRING(${points.map(([x, y]) => `${x} ${y}`).join(', ')})`;
+const GRID_CELL_SIZE = 120;
+const GRID_MARGIN_MIN = 1500;
+const GRID_MARGIN_MAX = 10000;
+const GRID_MAX_DIMENSION = 120;
 
 const parsePointWkt = (wkt) => {
   const match = /^POINT\(([-\d.]+) ([-\d.]+)\)$/i.exec(wkt.trim());
@@ -24,6 +30,152 @@ const parseLineStringWkt = (wkt) => {
     const [x, y] = pair.trim().split(/\s+/).map(Number);
     return [x, y];
   });
+};
+
+const getEnvelope = (points, margin = 0) => {
+  const xs = points.map(([x]) => x);
+  const ys = points.map(([, y]) => y);
+  return {
+    minX: Math.min(...xs) - margin,
+    minY: Math.min(...ys) - margin,
+    maxX: Math.max(...xs) + margin,
+    maxY: Math.max(...ys) + margin,
+  };
+};
+
+const distance = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+
+const pointInRing = (point, ring) => {
+  const [px, py] = point;
+  let inside = false;
+
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i, i += 1) {
+    const [xi, yi] = ring[i];
+    const [xj, yj] = ring[j];
+    const intersects = ((yi > py) !== (yj > py))
+      && (px < ((xj - xi) * (py - yi)) / ((yj - yi) || Number.EPSILON) + xi);
+    if (intersects) inside = !inside;
+  }
+
+  return inside;
+};
+
+const pointInPolygonCoordinates = (point, polygonCoords) => {
+  if (!pointInRing(point, polygonCoords[0])) {
+    return false;
+  }
+
+  for (let i = 1; i < polygonCoords.length; i += 1) {
+    if (pointInRing(point, polygonCoords[i])) {
+      return false;
+    }
+  }
+
+  return true;
+};
+
+const orientation = (a, b, c) => {
+  const value = (b[1] - a[1]) * (c[0] - b[0]) - (b[0] - a[0]) * (c[1] - b[1]);
+  if (Math.abs(value) < 1e-9) return 0;
+  return value > 0 ? 1 : 2;
+};
+
+const onSegment = (a, b, c) =>
+  Math.min(a[0], c[0]) <= b[0] && b[0] <= Math.max(a[0], c[0])
+  && Math.min(a[1], c[1]) <= b[1] && b[1] <= Math.max(a[1], c[1]);
+
+const segmentsIntersect = (p1, q1, p2, q2) => {
+  const o1 = orientation(p1, q1, p2);
+  const o2 = orientation(p1, q1, q2);
+  const o3 = orientation(p2, q2, p1);
+  const o4 = orientation(p2, q2, q1);
+
+  if (o1 !== o2 && o3 !== o4) return true;
+  if (o1 === 0 && onSegment(p1, p2, q1)) return true;
+  if (o2 === 0 && onSegment(p1, q2, q1)) return true;
+  if (o3 === 0 && onSegment(p2, p1, q2)) return true;
+  if (o4 === 0 && onSegment(p2, q1, q2)) return true;
+  return false;
+};
+
+const segmentIntersectsRing = (a, b, ring) => {
+  for (let i = 0; i < ring.length - 1; i += 1) {
+    if (segmentsIntersect(a, b, ring[i], ring[i + 1])) {
+      return true;
+    }
+  }
+  return false;
+};
+
+const geometryContainsPoint = (geometry, point) => {
+  if (!geometry) return false;
+  if (geometry.type === 'Polygon') {
+    return pointInPolygonCoordinates(point, geometry.coordinates);
+  }
+  if (geometry.type === 'MultiPolygon') {
+    return geometry.coordinates.some((polygon) => pointInPolygonCoordinates(point, polygon));
+  }
+  return false;
+};
+
+const geometryIntersectsSegment = (geometry, a, b) => {
+  if (!geometry) return false;
+
+  const polygons = geometry.type === 'Polygon'
+    ? [geometry.coordinates]
+    : geometry.type === 'MultiPolygon'
+      ? geometry.coordinates
+      : [];
+
+  return polygons.some((polygon) => {
+    if (pointInPolygonCoordinates(a, polygon) || pointInPolygonCoordinates(b, polygon)) {
+      return true;
+    }
+
+    return polygon.some((ring) => segmentIntersectsRing(a, b, ring));
+  });
+};
+
+const parseObstacleGeometries = (rows) => rows.map((row) => ({
+  obstacleType: row.obstacle_type,
+  obstacleGid: row.obstacle_gid,
+  geometry: row.geometry,
+}));
+
+const buildPathFromParents = (cameFrom, currentKey, nodesByKey) => {
+  const path = [nodesByKey.get(currentKey)];
+  let cursor = currentKey;
+  while (cameFrom.has(cursor)) {
+    cursor = cameFrom.get(cursor);
+    path.push(nodesByKey.get(cursor));
+  }
+  return path.reverse();
+};
+
+const smoothPath = (path, obstacles) => {
+  if (path.length <= 2) return path;
+
+  const smoothed = [path[0]];
+  let anchorIndex = 0;
+
+  while (anchorIndex < path.length - 1) {
+    let bestIndex = anchorIndex + 1;
+
+    for (let i = path.length - 1; i > anchorIndex + 1; i -= 1) {
+      const clear = obstacles.every(
+        (obstacle) => !geometryIntersectsSegment(obstacle.geometry, path[anchorIndex], path[i]),
+      );
+      if (clear) {
+        bestIndex = i;
+        break;
+      }
+    }
+
+    smoothed.push(path[bestIndex]);
+    anchorIndex = bestIndex;
+  }
+
+  return dedupeSequentialPoints(smoothed);
 };
 
 const dedupeSequentialPoints = (points) => {
@@ -142,14 +294,16 @@ const buildObstacleUnionSql = (
   `;
 };
 
-const fetchCandidateRoutes = async (pool, miningGid) => {
+const fetchCandidateRoutes = async (pool, miningGid, limit = CANDIDATE_LIMIT) => {
+  const baseLimit = Math.max(6, Math.ceil(limit * BASE_ROAD_SHARE));
+  const generatedLimit = Math.max(4, limit - baseLimit);
   const sql = `
     WITH site AS (
       SELECT gid, geom
       FROM ${qualifiedTable(TABLES.miningSites)}
       WHERE gid = $1
     ),
-    candidate_roads AS (
+    source_candidates AS (
       SELECT
         rn.gid AS road_gid,
         rn.road_type,
@@ -158,8 +312,27 @@ const fetchCandidateRoutes = async (pool, miningGid) => {
       FROM road_network rn
       CROSS JOIN site s
       WHERE rn.geom IS NOT NULL
+        AND rn.source_mining_site IS NULL
       ORDER BY rn.geom <-> s.geom
       LIMIT $2
+    ),
+    generated_candidates AS (
+      SELECT
+        rn.gid AS road_gid,
+        rn.road_type,
+        ST_ClosestPoint(ST_Boundary(s.geom), rn.geom) AS start_pt,
+        ST_ClosestPoint(rn.geom, ST_ClosestPoint(ST_Boundary(s.geom), rn.geom)) AS end_pt
+      FROM road_network rn
+      CROSS JOIN site s
+      WHERE rn.geom IS NOT NULL
+        AND rn.source_mining_site IS NOT NULL
+      ORDER BY rn.geom <-> s.geom
+      LIMIT $3
+    ),
+    candidate_roads AS (
+      SELECT * FROM source_candidates
+      UNION ALL
+      SELECT * FROM generated_candidates
     )
     SELECT
       road_gid,
@@ -171,7 +344,7 @@ const fetchCandidateRoutes = async (pool, miningGid) => {
     ORDER BY direct_length_m, road_gid
   `;
 
-  const result = await pool.query(sql, [miningGid, CANDIDATE_LIMIT]);
+  const result = await pool.query(sql, [miningGid, baseLimit, generatedLimit]);
   return result.rows.map((row) => ({
     ...row,
     startPoint: parsePointWkt(row.start_pt_wkt),
@@ -187,6 +360,193 @@ const fetchMiningSite = async (pool, miningGid) => {
     [miningGid],
   );
   return result.rows[0] || null;
+};
+
+const fetchLocalObstacles = async (db, miningGid, envelope, obstacleCacheTable = null, schoolSources = null, schoolBuffer = null) => {
+  const sql = obstacleCacheTable
+    ? `
+      SELECT
+        obstacle_type,
+        obstacle_gid,
+        ST_AsGeoJSON(ST_SimplifyPreserveTopology(obstacle_geom, 15))::jsonb AS geometry
+      FROM ${obstacleCacheTable}
+      WHERE ST_Intersects(
+        obstacle_geom,
+        ST_MakeEnvelope($1, $2, $3, $4, 32644)
+      )
+      AND NOT (obstacle_type = 'mining_site' AND obstacle_gid = $5)
+    `
+    : `
+      SELECT
+        obstacle_type,
+        obstacle_gid,
+        ST_AsGeoJSON(ST_SimplifyPreserveTopology(obstacle_geom, 15))::jsonb AS geometry
+      FROM (${buildObstacleUnionSql(schoolSources, miningGid, '$5')}) obstacle_union
+      WHERE ST_Intersects(
+        obstacle_geom,
+        ST_MakeEnvelope($1, $2, $3, $4, 32644)
+      )
+    `;
+
+  const params = obstacleCacheTable
+    ? [envelope.minX, envelope.minY, envelope.maxX, envelope.maxY, miningGid]
+    : [envelope.minX, envelope.minY, envelope.maxX, envelope.maxY, schoolBuffer];
+
+  const result = await db.query(sql, params);
+  return parseObstacleGeometries(result.rows);
+};
+
+const findClosestFreeGridPoint = (point, blockedSet, nodesByKey, cols, rows) => {
+  let bestNode = null;
+  let bestDistance = Number.POSITIVE_INFINITY;
+
+  for (let row = 0; row < rows; row += 1) {
+    for (let col = 0; col < cols; col += 1) {
+      const key = `${col}:${row}`;
+      if (blockedSet.has(key)) continue;
+      const node = nodesByKey.get(key);
+      const d = distance(point, node);
+      if (d < bestDistance) {
+        bestDistance = d;
+        bestNode = { key, point: node };
+      }
+    }
+  }
+
+  return bestNode;
+};
+
+const solveWithGridFallback = async (
+  db,
+  miningGid,
+  schoolBuffer,
+  candidate,
+  obstacleCacheTable,
+  schoolSources,
+) => {
+  const directDistance = distance(candidate.startPoint, candidate.endPoint);
+  const margin = Math.max(GRID_MARGIN_MIN, Math.min(GRID_MARGIN_MAX, directDistance * 0.8));
+  const envelope = getEnvelope([candidate.startPoint, candidate.endPoint], margin);
+  const width = envelope.maxX - envelope.minX;
+  const height = envelope.maxY - envelope.minY;
+
+  let cellSize = GRID_CELL_SIZE;
+  while ((width / cellSize > GRID_MAX_DIMENSION || height / cellSize > GRID_MAX_DIMENSION) && cellSize < 300) {
+    cellSize += 20;
+  }
+
+  const cols = Math.max(3, Math.ceil(width / cellSize) + 1);
+  const rows = Math.max(3, Math.ceil(height / cellSize) + 1);
+  const obstacles = await fetchLocalObstacles(
+    db,
+    miningGid,
+    envelope,
+    obstacleCacheTable,
+    schoolSources,
+    schoolBuffer,
+  );
+
+  const nodesByKey = new Map();
+  const blockedSet = new Set();
+
+  for (let row = 0; row < rows; row += 1) {
+    for (let col = 0; col < cols; col += 1) {
+      const point = [
+        envelope.minX + col * cellSize,
+        envelope.minY + row * cellSize,
+      ];
+      const key = `${col}:${row}`;
+      nodesByKey.set(key, point);
+
+      if (obstacles.some((obstacle) => geometryContainsPoint(obstacle.geometry, point))) {
+        blockedSet.add(key);
+      }
+    }
+  }
+
+  const startNode = findClosestFreeGridPoint(candidate.startPoint, blockedSet, nodesByKey, cols, rows);
+  const endNode = findClosestFreeGridPoint(candidate.endPoint, blockedSet, nodesByKey, cols, rows);
+
+  if (!startNode || !endNode) {
+    return null;
+  }
+
+  const open = new Set([startNode.key]);
+  const cameFrom = new Map();
+  const gScore = new Map([[startNode.key, 0]]);
+  const fScore = new Map([[startNode.key, distance(startNode.point, endNode.point)]]);
+
+  while (open.size > 0) {
+    let currentKey = null;
+    let currentScore = Number.POSITIVE_INFINITY;
+    for (const key of open) {
+      const score = fScore.get(key) ?? Number.POSITIVE_INFINITY;
+      if (score < currentScore) {
+        currentScore = score;
+        currentKey = key;
+      }
+    }
+
+    if (!currentKey) break;
+    if (currentKey === endNode.key) {
+      const gridPath = buildPathFromParents(cameFrom, currentKey, nodesByKey);
+      const fullPath = dedupeSequentialPoints([
+        candidate.startPoint,
+        ...gridPath,
+        candidate.endPoint,
+      ]);
+      const smoothed = smoothPath(fullPath, obstacles);
+      if (smoothed.length < 2) {
+        return null;
+      }
+      const measured = await measurePath(db, smoothed);
+      return {
+        connected: true,
+        roadGid: candidate.road_gid,
+        pathLength: Number(measured.length_m),
+        pathCost: Number(measured.length_m),
+        geometry: measured.geometry,
+        geometryWkt: lineWkt(smoothed),
+        entryPoint: { type: 'Point', coordinates: candidate.startPoint },
+        connectionPoint: { type: 'Point', coordinates: candidate.endPoint },
+        entryPointWkt: candidate.start_pt_wkt,
+        connectionPointWkt: candidate.end_pt_wkt,
+        isCurved: smoothed.length > 2,
+        plannerMode: 'grid_fallback_shortest_route',
+      };
+    }
+
+    open.delete(currentKey);
+    const [col, row] = currentKey.split(':').map(Number);
+    const currentPoint = nodesByKey.get(currentKey);
+
+    for (let dCol = -1; dCol <= 1; dCol += 1) {
+      for (let dRow = -1; dRow <= 1; dRow += 1) {
+        if (dCol === 0 && dRow === 0) continue;
+        const nextCol = col + dCol;
+        const nextRow = row + dRow;
+        if (nextCol < 0 || nextCol >= cols || nextRow < 0 || nextRow >= rows) continue;
+
+        const neighborKey = `${nextCol}:${nextRow}`;
+        if (blockedSet.has(neighborKey)) continue;
+
+        const neighborPoint = nodesByKey.get(neighborKey);
+        if (obstacles.some((obstacle) => geometryIntersectsSegment(obstacle.geometry, currentPoint, neighborPoint))) {
+          continue;
+        }
+
+        const tentativeG = (gScore.get(currentKey) ?? Number.POSITIVE_INFINITY) + distance(currentPoint, neighborPoint);
+        if (tentativeG < (gScore.get(neighborKey) ?? Number.POSITIVE_INFINITY)) {
+          cameFrom.set(neighborKey, currentKey);
+          gScore.set(neighborKey, tentativeG);
+          fScore.set(neighborKey, tentativeG + distance(neighborPoint, endNode.point));
+          open.add(neighborKey);
+        }
+      }
+    }
+  }
+
+  return null;
 };
 
 const assessSegmentObstacle = async (db, schoolSources, miningGid, schoolBuffer, segmentPoints, obstacleCacheTable = null) => {
@@ -647,75 +1007,134 @@ export const calculateRouteForMiningSite = async (
   pool,
   { miningGid, schoolBuffer, persist = false, schoolSources = null, obstacleCacheTable = null },
 ) => {
+  if (!obstacleCacheTable && typeof pool.connect === 'function' && typeof pool.release !== 'function') {
+    const client = await pool.connect();
+    try {
+      const cachedSchoolSources = schoolSources || (await getExistingSchoolSources(client));
+      await createObstacleCache(client, cachedSchoolSources, schoolBuffer);
+      return await calculateRouteForMiningSite(client, {
+        miningGid,
+        schoolBuffer,
+        persist,
+        schoolSources: cachedSchoolSources,
+        obstacleCacheTable: TEMP_OBSTACLE_CACHE,
+      });
+    } finally {
+      client.release();
+    }
+  }
+
   const miningSite = await fetchMiningSite(pool, miningGid);
   if (!miningSite) {
     return null;
   }
 
   const resolvedSchoolSources = schoolSources || (await getExistingSchoolSources(pool));
-  const candidates = await fetchCandidateRoutes(pool, miningGid);
+  let bestConnected = null;
   let bestBlocked = null;
+  const seenRoads = new Set();
+  const candidatePool = [];
 
-  for (const candidate of candidates) {
-    const outcome = await solveCandidatePath(
-      pool,
-      resolvedSchoolSources,
-      miningGid,
-      schoolBuffer,
-      candidate,
-      obstacleCacheTable,
-    );
-    if (outcome.connected) {
-      let generatedRoadGid = null;
+  for (const limit of CANDIDATE_LIMIT_STEPS) {
+    const candidates = await fetchCandidateRoutes(pool, miningGid, limit);
 
-      if (persist) {
-        generatedRoadGid = await insertGeneratedRoad(pool, miningGid, outcome);
-        await upsertConnectionStatus(pool, {
-          miningGid,
-          isConnected: true,
-          connectionRoadGid: generatedRoadGid,
-          connectionCost: outcome.pathCost,
-          pathLength: outcome.pathLength,
-          pathStrategy: outcome.plannerMode,
-          reasonCode: null,
-          reasonDetail: null,
-          entryPointWkt: outcome.entryPointWkt,
-          connectionPointWkt: outcome.connectionPointWkt,
-          geometryWkt: outcome.geometryWkt,
-          metadata: {
-            schoolBuffer,
-            connectedRoadGid: outcome.roadGid,
-            isCurved: outcome.isCurved,
-          },
-        });
+    for (const candidate of candidates) {
+      if (seenRoads.has(candidate.road_gid)) {
+        continue;
+      }
+      seenRoads.add(candidate.road_gid);
+      candidatePool.push(candidate);
+
+      if (bestConnected && Number(candidate.direct_length_m) >= bestConnected.pathLength) {
+        continue;
       }
 
-      return {
+      const outcome = await solveCandidatePath(
+        pool,
+        resolvedSchoolSources,
         miningGid,
-        miningName: miningSite.name,
-        connected: true,
         schoolBuffer,
-        plannerMode: outcome.plannerMode,
-        roadGid: outcome.roadGid,
-        generatedRoadGid,
-        pathLength: outcome.pathLength,
-        pathCost: outcome.pathCost,
-        geometry: outcome.geometry,
-        entryPoint: {
-          type: 'Point',
-          coordinates: outcome.entryPoint.coordinates,
-        },
-        connectionPoint: {
-          type: 'Point',
-          coordinates: outcome.connectionPoint.coordinates,
-        },
-        isCurved: outcome.isCurved,
-      };
+        candidate,
+        obstacleCacheTable,
+      );
+
+      if (outcome.connected && (!bestConnected || outcome.pathLength < bestConnected.pathLength)) {
+        bestConnected = outcome;
+      }
+
+      if (!outcome.connected && !bestBlocked) {
+        bestBlocked = outcome;
+      }
     }
 
-    if (!bestBlocked) {
-      bestBlocked = outcome;
+    if (bestConnected) {
+      break;
     }
+  }
+
+  if (!bestConnected) {
+    for (const candidate of candidatePool.slice(0, 6)) {
+      const gridOutcome = await solveWithGridFallback(
+        pool,
+        miningGid,
+        schoolBuffer,
+        candidate,
+        obstacleCacheTable,
+        resolvedSchoolSources,
+      );
+
+      if (gridOutcome && (!bestConnected || gridOutcome.pathLength < bestConnected.pathLength)) {
+        bestConnected = gridOutcome;
+      }
+    }
+  }
+
+  if (bestConnected) {
+    let generatedRoadGid = null;
+
+    if (persist) {
+      generatedRoadGid = await insertGeneratedRoad(pool, miningGid, bestConnected);
+      await upsertConnectionStatus(pool, {
+        miningGid,
+        isConnected: true,
+        connectionRoadGid: generatedRoadGid,
+        connectionCost: bestConnected.pathCost,
+        pathLength: bestConnected.pathLength,
+        pathStrategy: bestConnected.plannerMode,
+        reasonCode: null,
+        reasonDetail: null,
+        entryPointWkt: bestConnected.entryPointWkt,
+        connectionPointWkt: bestConnected.connectionPointWkt,
+        geometryWkt: bestConnected.geometryWkt,
+        metadata: {
+          schoolBuffer,
+          connectedRoadGid: bestConnected.roadGid,
+          isCurved: bestConnected.isCurved,
+        },
+      });
+    }
+
+    return {
+      miningGid,
+      miningName: miningSite.name,
+      connected: true,
+      schoolBuffer,
+      plannerMode: bestConnected.plannerMode,
+      roadGid: bestConnected.roadGid,
+      generatedRoadGid,
+      pathLength: bestConnected.pathLength,
+      pathCost: bestConnected.pathCost,
+      geometry: bestConnected.geometry,
+      entryPoint: {
+        type: 'Point',
+        coordinates: bestConnected.entryPoint.coordinates,
+      },
+      connectionPoint: {
+        type: 'Point',
+        coordinates: bestConnected.connectionPoint.coordinates,
+      },
+      isCurved: bestConnected.isCurved,
+    };
   }
 
   const blockedResponse = {
@@ -726,7 +1145,7 @@ export const calculateRouteForMiningSite = async (
     reasonCode: bestBlocked?.reasonCode || 'NO_VALID_PATH',
     reasonDetail: bestBlocked?.reasonDetail || 'No valid connector satisfied the current exclusion rules.',
     plannerMode: PLANNER_MODE,
-    attemptedCandidates: candidates.length,
+    attemptedCandidates: seenRoads.size,
   };
 
   if (persist) {
@@ -744,7 +1163,7 @@ export const calculateRouteForMiningSite = async (
       geometryWkt: null,
       metadata: {
         schoolBuffer,
-        attemptedCandidates: candidates.length,
+        attemptedCandidates: seenRoads.size,
       },
     });
   }
@@ -752,25 +1171,58 @@ export const calculateRouteForMiningSite = async (
   return blockedResponse;
 };
 
-export const generateRoutesForMiningSites = async (pool, { batchSize, schoolBuffer }) => {
+export const generateRoutesForMiningSites = async (pool, { batchSize, schoolBuffer, appendMode = true }) => {
   const client = await pool.connect();
 
   try {
-    await reseedBaseRoadNetwork(client);
+    if (!appendMode) {
+      await reseedBaseRoadNetwork(client);
+    }
     const schoolSources = await getExistingSchoolSources(client);
     await createObstacleCache(client, schoolSources, schoolBuffer);
 
     const totalResult = await client.query(`SELECT COUNT(*)::int AS count FROM ${qualifiedTable(TABLES.miningSites)}`);
     const totalSites = totalResult.rows[0].count;
     const limit = batchSize && batchSize > 0 ? Math.min(batchSize, totalSites) : totalSites;
+    const blockedResult = await client.query(`
+      SELECT COUNT(*)::int AS count
+      FROM mining_connection_status
+      WHERE NOT is_connected
+    `);
+    const blockedCount = blockedResult.rows[0].count;
+    const blockedQuota = limit > 1 && blockedCount > 0 ? Math.max(1, Math.floor(limit * 0.25)) : 0;
+    const pendingQuota = Math.max(1, limit - blockedQuota);
 
     const miningResult = await client.query(
-      `SELECT gid
-       FROM ${qualifiedTable(TABLES.miningSites)}
-       WHERE geom IS NOT NULL
-       ORDER BY gid
-       LIMIT $1`,
-      [limit],
+      `WITH unprocessed AS (
+         SELECT gb.gid, 0 AS priority
+         FROM ${qualifiedTable(TABLES.miningSites)} gb
+         LEFT JOIN mining_connection_status mcs
+           ON mcs.mining_gid = gb.gid
+         WHERE gb.geom IS NOT NULL
+           AND mcs.mining_gid IS NULL
+         ORDER BY gb.gid
+         LIMIT $1
+       ),
+       blocked_retry AS (
+         SELECT gb.gid, 1 AS priority
+         FROM ${qualifiedTable(TABLES.miningSites)} gb
+         JOIN mining_connection_status mcs
+           ON mcs.mining_gid = gb.gid
+         WHERE gb.geom IS NOT NULL
+           AND NOT mcs.is_connected
+         ORDER BY gb.gid
+         LIMIT $2
+       )
+       SELECT gid
+       FROM (
+         SELECT * FROM unprocessed
+         UNION ALL
+         SELECT * FROM blocked_retry
+       ) selected
+       ORDER BY priority, gid
+       LIMIT $3`,
+      [pendingQuota, blockedQuota || limit, limit],
     );
 
     let processedCount = 0;
@@ -820,6 +1272,7 @@ export const generateRoutesForMiningSites = async (pool, { batchSize, schoolBuff
       totalSites,
       selectedSites: limit,
       schoolBuffer,
+      appendMode,
     };
   } finally {
     client.release();
