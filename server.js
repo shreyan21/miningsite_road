@@ -48,7 +48,7 @@ app.get('/api/map-layers', asyncHandler(async (req, res) => {
   const schoolBuffer = parsePositiveNumber(req.query.schoolBuffer, 500);
   const payload = await getMapLayers(pool, {
     schoolBuffer,
-    includeSchools: req.query.includeSchools === 'true',
+    includeSchools: req.query.includeSchools !== 'false',
     includeObstacles: req.query.includeObstacles === 'true',
     includeRoadSources: req.query.includeRoadSources === 'true',
   });

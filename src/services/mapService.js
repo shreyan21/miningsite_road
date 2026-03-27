@@ -80,23 +80,29 @@ export const getRiversGeoJson = async (pool) => {
 };
 
 export const getSchoolsGeoJson = async (pool) => {
-  const schoolSources = await getExistingSchoolSources(pool);
+  const schoolSources = (await getExistingSchoolSources(pool))
+    .filter((source) => !source.isBuffered);
   if (schoolSources.length === 0) {
     return featureCollectionFromRows([]);
   }
 
   const unions = schoolSources.map((source) => `
     SELECT
-      gid AS id,
-      ST_AsGeoJSON(ST_Transform(${quoteIdentifier(source.geomColumn)}, 4326))::jsonb AS geometry,
+      src.${quoteIdentifier(source.idColumn || 'gid')} AS id,
+      ST_AsGeoJSON(ST_Transform(src.${quoteIdentifier(source.geomColumn)}, 4326))::jsonb AS geometry,
       jsonb_build_object(
-        'name', COALESCE(${quoteIdentifier(source.nameColumn)}, 'Unnamed School'),
-        'district', ${source.districtColumn ? `COALESCE(${quoteIdentifier(source.districtColumn)}, '')` : "''"},
+        'name', ${
+          source.nameColumn
+            ? `COALESCE(src.${quoteIdentifier(source.nameColumn)}, ${quoteLiteral(source.label || 'Unnamed School')})`
+            : quoteLiteral(source.label || 'Unnamed School')
+        },
+        'district', ${source.districtColumn ? `COALESCE(src.${quoteIdentifier(source.districtColumn)}, '')` : "''"},
         'source', ${quoteLiteral(source.tableName)},
-        'label', ${quoteLiteral(source.label)}
+        'label', ${quoteLiteral(source.label)},
+        'is_buffer', ${source.isBuffered ? 'true' : 'false'}
       ) AS properties
-    FROM ${qualifiedTable(source.tableName)}
-    WHERE ${quoteIdentifier(source.geomColumn)} IS NOT NULL
+    FROM ${qualifiedTable(source.tableName)} src
+    WHERE src.${quoteIdentifier(source.geomColumn)} IS NOT NULL
   `);
 
   return loadGeoJsonRows(pool, unions.join(' UNION ALL '));
@@ -111,12 +117,21 @@ export const getObstacleGeoJson = async (pool, { schoolBuffer, includeSchoolBuff
     for (const source of schoolSources) {
       parts.push(`
         SELECT
-          gid AS id,
-          ST_AsGeoJSON(ST_Transform(ST_Buffer(${quoteIdentifier(source.geomColumn)}, $1), 4326))::jsonb AS geometry,
+          ${quoteIdentifier(source.idColumn || 'gid')} AS id,
+          ST_AsGeoJSON(ST_Transform(${
+            source.isBuffered
+              ? quoteIdentifier(source.geomColumn)
+              : `ST_Buffer(${quoteIdentifier(source.geomColumn)}, $1)`
+          }, 4326))::jsonb AS geometry,
           jsonb_build_object(
             'type', 'school_buffer',
-            'name', COALESCE(${quoteIdentifier(source.nameColumn)}, 'Unnamed School'),
-            'source', ${quoteLiteral(source.tableName)}
+            'name', ${
+              source.nameColumn
+                ? `COALESCE(${quoteIdentifier(source.nameColumn)}, ${quoteLiteral(source.label || 'Unnamed School')})`
+                : quoteLiteral(source.label || 'Unnamed School')
+            },
+            'source', ${quoteLiteral(source.tableName)},
+            'is_buffer', ${source.isBuffered ? 'true' : 'false'}
           ) AS properties
         FROM ${qualifiedTable(source.tableName)}
         WHERE ${quoteIdentifier(source.geomColumn)} IS NOT NULL

@@ -2,13 +2,14 @@ import { SCHOOL_SOURCES, TABLES } from '../config/datasets.js';
 import { qualifiedTable, quoteIdentifier, tableExists } from '../utils/sql.js';
 import { reseedBaseRoadNetwork } from './bootstrap.js';
 
-const CANDIDATE_LIMIT = 14;
-const CANDIDATE_LIMIT_STEPS = [14, 40, 80, 140];
+const CANDIDATE_LIMIT = 24;
+const CANDIDATE_LIMIT_STEPS = [24, 72, 160, 260];
 const MAX_DETOUR_DEPTH = 6;
 const DETOUR_CLEARANCE = 30;
 const PLANNER_MODE = 'obstacle_aware_polyline';
 const TEMP_OBSTACLE_CACHE = 'temp_route_obstacle_cache';
 const BASE_ROAD_SHARE = 0.65;
+const GRID_FALLBACK_CANDIDATES = 18;
 
 const pointWkt = ([x, y]) => `POINT(${x} ${y})`;
 const lineWkt = (points) => `LINESTRING(${points.map(([x, y]) => `${x} ${y}`).join(', ')})`;
@@ -209,8 +210,12 @@ const createObstacleCache = async (db, schoolSources, schoolBuffer) => {
   const schoolParts = schoolSources.map((source) => `
     SELECT
       'school_buffer'::text AS obstacle_type,
-      gid AS obstacle_gid,
-      ST_Buffer(${quoteIdentifier(source.geomColumn)}, ${schoolBuffer})::geometry(Polygon, 32644) AS obstacle_geom
+      ${quoteIdentifier(source.idColumn || 'gid')} AS obstacle_gid,
+      ${
+        source.isBuffered
+          ? `${quoteIdentifier(source.geomColumn)}::geometry`
+          : `ST_Buffer(${quoteIdentifier(source.geomColumn)}, ${schoolBuffer})::geometry(Polygon, 32644)`
+      } AS obstacle_geom
     FROM ${qualifiedTable(source.tableName)}
     WHERE ${quoteIdentifier(source.geomColumn)} IS NOT NULL
   `);
@@ -256,8 +261,12 @@ const buildObstacleUnionSql = (
   const schoolParts = schoolSources.map((source) => `
     SELECT
       'school_buffer'::text AS obstacle_type,
-      gid AS obstacle_gid,
-      ST_Buffer(${quoteIdentifier(source.geomColumn)}, ${schoolBufferPlaceholder})::geometry(Polygon, 32644) AS obstacle_geom
+      ${quoteIdentifier(source.idColumn || 'gid')} AS obstacle_gid,
+      ${
+        source.isBuffered
+          ? `${quoteIdentifier(source.geomColumn)}::geometry`
+          : `ST_Buffer(${quoteIdentifier(source.geomColumn)}, ${schoolBufferPlaceholder})::geometry(Polygon, 32644)`
+      } AS obstacle_geom
     FROM ${qualifiedTable(source.tableName)}
     WHERE ${quoteIdentifier(source.geomColumn)} IS NOT NULL
   `);
@@ -299,49 +308,50 @@ const fetchCandidateRoutes = async (pool, miningGid, limit = CANDIDATE_LIMIT) =>
   const generatedLimit = Math.max(4, limit - baseLimit);
   const sql = `
     WITH site AS (
-      SELECT gid, geom
+      SELECT
+        gid,
+        geom,
+        ST_Boundary(geom) AS boundary_geom
       FROM ${qualifiedTable(TABLES.miningSites)}
       WHERE gid = $1
     ),
-    source_candidates AS (
+    ranked_roads AS (
       SELECT
         rn.gid AS road_gid,
         rn.road_type,
-        ST_ClosestPoint(ST_Boundary(s.geom), rn.geom) AS start_pt,
-        ST_ClosestPoint(rn.geom, ST_ClosestPoint(ST_Boundary(s.geom), rn.geom)) AS end_pt
+        CASE
+          WHEN rn.source_mining_site IS NULL THEN 0
+          ELSE 1
+        END AS source_priority,
+        ST_ClosestPoint(s.boundary_geom, rn.geom) AS start_pt,
+        ST_ClosestPoint(rn.geom, ST_ClosestPoint(s.boundary_geom, rn.geom)) AS end_pt,
+        ST_Distance(rn.geom, s.boundary_geom) AS boundary_distance,
+        ROW_NUMBER() OVER (
+          PARTITION BY CASE WHEN rn.source_mining_site IS NULL THEN 0 ELSE 1 END
+          ORDER BY
+            ST_Distance(rn.geom, s.boundary_geom),
+            rn.geom <-> s.boundary_geom,
+            rn.gid
+        ) AS road_rank
       FROM road_network rn
       CROSS JOIN site s
       WHERE rn.geom IS NOT NULL
-        AND rn.source_mining_site IS NULL
-      ORDER BY rn.geom <-> s.geom
-      LIMIT $2
-    ),
-    generated_candidates AS (
-      SELECT
-        rn.gid AS road_gid,
-        rn.road_type,
-        ST_ClosestPoint(ST_Boundary(s.geom), rn.geom) AS start_pt,
-        ST_ClosestPoint(rn.geom, ST_ClosestPoint(ST_Boundary(s.geom), rn.geom)) AS end_pt
-      FROM road_network rn
-      CROSS JOIN site s
-      WHERE rn.geom IS NOT NULL
-        AND rn.source_mining_site IS NOT NULL
-      ORDER BY rn.geom <-> s.geom
-      LIMIT $3
     ),
     candidate_roads AS (
-      SELECT * FROM source_candidates
-      UNION ALL
-      SELECT * FROM generated_candidates
+      SELECT *
+      FROM ranked_roads
+      WHERE (source_priority = 0 AND road_rank <= $2)
+        OR (source_priority = 1 AND road_rank <= $3)
     )
     SELECT
       road_gid,
       road_type,
       ST_AsText(start_pt) AS start_pt_wkt,
       ST_AsText(end_pt) AS end_pt_wkt,
+      boundary_distance,
       ST_Length(ST_MakeLine(start_pt, end_pt)) AS direct_length_m
     FROM candidate_roads
-    ORDER BY direct_length_m, road_gid
+    ORDER BY direct_length_m, boundary_distance, source_priority, road_gid
   `;
 
   const result = await pool.query(sql, [miningGid, baseLimit, generatedLimit]);
@@ -777,7 +787,9 @@ const createDetourPath = async (
       ST_AsText(path_geom) AS path_wkt,
       ST_Length(path_geom) AS length_m
     FROM valid_candidates
-    ORDER BY length_m
+    ORDER BY
+      CASE WHEN is_curved THEN 0 ELSE 1 END,
+      length_m
     LIMIT 1
   `;
 
@@ -1073,7 +1085,16 @@ export const calculateRouteForMiningSite = async (
   }
 
   if (!bestConnected) {
-    for (const candidate of candidatePool.slice(0, 6)) {
+    const fallbackCandidates = candidatePool
+      .slice()
+      .sort((a, b) => {
+        const directGap = Number(a.direct_length_m) - Number(b.direct_length_m);
+        if (directGap !== 0) return directGap;
+        return Number(a.boundary_distance || 0) - Number(b.boundary_distance || 0);
+      })
+      .slice(0, GRID_FALLBACK_CANDIDATES);
+
+    for (const candidate of fallbackCandidates) {
       const gridOutcome = await solveWithGridFallback(
         pool,
         miningGid,

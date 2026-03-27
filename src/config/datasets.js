@@ -8,6 +8,7 @@ export const TABLES = {
 export const SCHOOL_SOURCES = [
   {
     tableName: 'uprsac_09xxxx_educschool_20132016',
+    idColumn: 'gid',
     geomColumn: 'geom',
     nameColumn: 'schname',
     districtColumn: 'districtna',
@@ -15,10 +16,18 @@ export const SCHOOL_SOURCES = [
   },
   {
     tableName: 'gorakhpur_ps',
+    idColumn: 'gid',
     geomColumn: 'geom',
     nameColumn: 'field1',
     districtColumn: 'field2',
     label: 'Point School',
+  },
+  {
+    tableName: 'school_buffer',
+    idColumn: 'id',
+    geomColumn: 'geom',
+    isBuffered: true,
+    label: 'Imported School Buffer',
   },
 ];
 
