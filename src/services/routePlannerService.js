@@ -13,6 +13,7 @@ const BASE_ROAD_SHARE = 0.65;
 const GRID_FALLBACK_CANDIDATES = 4;
 const MAX_CANDIDATE_PATH_EVALUATIONS = 36;
 export const MAX_BATCH_SELECTION = 60;
+export const DEFAULT_BATCH_SELECTION = 4;
 const MAX_GRID_OBSTACLES = 400;
 
 const pointWkt = ([x, y]) => `POINT(${x} ${y})`;
@@ -1320,7 +1321,12 @@ export const calculateRouteForMiningSite = async (
 };
 
 export const generateRoutesForMiningSites = async (pool, { batchSize, schoolBuffer, appendMode = true }) => {
-  return generateRoutesForMiningSitesWithProgress(pool, { batchSize, schoolBuffer, appendMode });
+  return generateRoutesForMiningSitesWithProgress(pool, {
+    batchSize,
+    schoolBuffer,
+    appendMode,
+    retryBlocked: false,
+  });
 };
 
 export const generateRoutesForMiningSitesWithProgress = async (
@@ -1329,6 +1335,7 @@ export const generateRoutesForMiningSitesWithProgress = async (
     batchSize,
     schoolBuffer,
     appendMode = true,
+    retryBlocked = false,
     onProgress = null,
   },
 ) => {
@@ -1343,7 +1350,9 @@ export const generateRoutesForMiningSitesWithProgress = async (
 
     const totalResult = await client.query(`SELECT COUNT(*)::int AS count FROM ${qualifiedTable(TABLES.miningSites)}`);
     const totalSites = totalResult.rows[0].count;
-    const requestedSites = batchSize && batchSize > 0 ? Math.min(batchSize, totalSites) : totalSites;
+    const requestedSites = batchSize && batchSize > 0
+      ? Math.min(batchSize, totalSites)
+      : Math.min(DEFAULT_BATCH_SELECTION, totalSites);
     const limit = Math.min(requestedSites, MAX_BATCH_SELECTION);
     const selectionWasCapped = requestedSites > MAX_BATCH_SELECTION;
     const blockedResult = await client.query(`
@@ -1352,7 +1361,7 @@ export const generateRoutesForMiningSitesWithProgress = async (
       WHERE NOT is_connected
     `);
     const blockedCount = blockedResult.rows[0].count;
-    const blockedQuota = limit > 1 && blockedCount > 0 ? Math.max(1, Math.floor(limit * 0.25)) : 0;
+    const blockedQuota = retryBlocked && limit > 1 && blockedCount > 0 ? Math.max(1, Math.floor(limit * 0.25)) : 0;
     const pendingQuota = Math.max(1, limit - blockedQuota);
 
     const miningResult = await client.query(
@@ -1361,9 +1370,16 @@ export const generateRoutesForMiningSitesWithProgress = async (
          FROM ${qualifiedTable(TABLES.miningSites)} gb
          LEFT JOIN mining_connection_status mcs
            ON mcs.mining_gid = gb.gid
+         LEFT JOIN LATERAL (
+           SELECT rn.geom <-> gb.geom AS road_distance
+           FROM road_network rn
+           WHERE rn.geom IS NOT NULL
+           ORDER BY rn.geom <-> gb.geom
+           LIMIT 1
+         ) nearest ON true
          WHERE gb.geom IS NOT NULL
            AND mcs.mining_gid IS NULL
-         ORDER BY gb.gid
+         ORDER BY nearest.road_distance NULLS LAST, gb.gid
          LIMIT $1
        ),
        blocked_retry AS (
@@ -1371,9 +1387,16 @@ export const generateRoutesForMiningSitesWithProgress = async (
          FROM ${qualifiedTable(TABLES.miningSites)} gb
          JOIN mining_connection_status mcs
            ON mcs.mining_gid = gb.gid
+         LEFT JOIN LATERAL (
+           SELECT rn.geom <-> gb.geom AS road_distance
+           FROM road_network rn
+           WHERE rn.geom IS NOT NULL
+           ORDER BY rn.geom <-> gb.geom
+           LIMIT 1
+         ) nearest ON true
          WHERE gb.geom IS NOT NULL
            AND NOT mcs.is_connected
-         ORDER BY gb.gid
+         ORDER BY nearest.road_distance NULLS LAST, gb.gid
          LIMIT $2
        )
        SELECT gid
@@ -1404,6 +1427,7 @@ export const generateRoutesForMiningSitesWithProgress = async (
         failedSites: 0,
         percentComplete: totalSelected === 0 ? 100 : 0,
         maximumBatchSize: MAX_BATCH_SELECTION,
+        defaultBatchSize: DEFAULT_BATCH_SELECTION,
         selectionWasCapped,
       });
     }
@@ -1473,6 +1497,8 @@ export const generateRoutesForMiningSitesWithProgress = async (
       requestedSites,
       selectedSites: limit,
       maximumBatchSize: MAX_BATCH_SELECTION,
+      defaultBatchSize: DEFAULT_BATCH_SELECTION,
+      retryBlocked,
       selectionWasCapped,
       schoolBuffer,
       appendMode,
@@ -1490,6 +1516,7 @@ export const generateRoutesForMiningSitesWithProgress = async (
         failedSites: failedDetails.length,
         percentComplete: 100,
         maximumBatchSize: MAX_BATCH_SELECTION,
+        defaultBatchSize: DEFAULT_BATCH_SELECTION,
         selectionWasCapped,
         message: summary.message,
       });

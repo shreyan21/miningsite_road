@@ -13,6 +13,7 @@ import {
 } from './src/services/mapService.js';
 import {
   calculateRouteForMiningSite,
+  DEFAULT_BATCH_SELECTION,
   generateRoutesForMiningSites,
   generateRoutesForSelectedMiningSites,
   generateRoutesForMiningSitesWithProgress,
@@ -113,6 +114,7 @@ app.get('/api/map-layers', asyncHandler(async (req, res) => {
 app.get('/api/runtime-config', asyncHandler(async (req, res) => {
   res.json({
     maximumBatchSize: MAX_BATCH_SELECTION,
+    defaultBatchSize: DEFAULT_BATCH_SELECTION,
     topBanner: {
       type: 'info',
       message: `A maximum of ${MAX_BATCH_SELECTION} sites can be selected in one run.`,
@@ -190,6 +192,7 @@ app.post('/api/generate-all-roads', asyncHandler(async (req, res) => {
   const schoolBuffer = parsePositiveNumber(req.body.schoolBuffer, 500);
   const appendMode = req.body.appendMode !== false;
   const runAsync = req.body.async === true;
+  const retryBlocked = req.body.retryBlocked === true;
 
   if (Number.isInteger(batchSize) && batchSize > MAX_BATCH_SELECTION) {
     return res.status(400).json({
@@ -206,7 +209,7 @@ app.post('/api/generate-all-roads', asyncHandler(async (req, res) => {
 
   if (runAsync) {
     const job = createGenerationJob({
-      batchSize: Number.isInteger(batchSize) && batchSize > 0 ? batchSize : null,
+      batchSize: Number.isInteger(batchSize) && batchSize > 0 ? batchSize : DEFAULT_BATCH_SELECTION,
       schoolBuffer,
       appendMode,
     });
@@ -222,6 +225,7 @@ app.post('/api/generate-all-roads', asyncHandler(async (req, res) => {
       batchSize: Number.isInteger(batchSize) && batchSize > 0 ? batchSize : null,
       schoolBuffer,
       appendMode,
+      retryBlocked,
       onProgress: async (progress) => {
         updateGenerationJob(job.id, {
           status: progress.stage === 'completed' ? 'completed' : 'running',
@@ -258,6 +262,7 @@ app.post('/api/generate-all-roads', asyncHandler(async (req, res) => {
       async: true,
       jobId: job.id,
       maximumBatchSize: MAX_BATCH_SELECTION,
+      defaultBatchSize: DEFAULT_BATCH_SELECTION,
       topBanner: {
         type: 'info',
         message: `A maximum of ${MAX_BATCH_SELECTION} sites can be selected in one run.`,
