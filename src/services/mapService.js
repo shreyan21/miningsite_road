@@ -26,6 +26,21 @@ const getExistingSchoolSources = async (pool) => {
   return entries;
 };
 
+const getSchoolDisplaySources = (sources) =>
+  sources.filter((source) => !source.isBuffered && source.useForDisplay !== false);
+
+const getSchoolObstacleSources = (sources) => {
+  const bufferedSources = sources.filter((source) => source.isBuffered && source.useForObstacles !== false);
+  if (bufferedSources.length > 0) {
+    return [
+      ...bufferedSources,
+      ...sources.filter((source) => !source.isBuffered && source.tableName === 'gorakhpur_ps' && source.useForObstacles !== false),
+    ];
+  }
+
+  return sources.filter((source) => source.useForObstacles !== false);
+};
+
 export const getMiningSitesGeoJson = async (pool) => {
   const sql = `
     SELECT
@@ -80,16 +95,20 @@ export const getRiversGeoJson = async (pool) => {
 };
 
 export const getSchoolsGeoJson = async (pool) => {
-  const schoolSources = (await getExistingSchoolSources(pool))
-    .filter((source) => !source.isBuffered);
+  const schoolSources = getSchoolDisplaySources(await getExistingSchoolSources(pool));
   if (schoolSources.length === 0) {
     return featureCollectionFromRows([]);
   }
 
   const unions = schoolSources.map((source) => `
     SELECT
-      src.${quoteIdentifier(source.idColumn || 'gid')} AS id,
-      ST_AsGeoJSON(ST_Transform(src.${quoteIdentifier(source.geomColumn)}, 4326))::jsonb AS geometry,
+      ${quoteLiteral(`${source.tableName}:`)} || src.${quoteIdentifier(source.idColumn || 'gid')}::text AS id,
+      ST_AsGeoJSON(
+        ST_Transform(
+          ST_PointOnSurface(src.${quoteIdentifier(source.geomColumn)}),
+          4326
+        )
+      )::jsonb AS geometry,
       jsonb_build_object(
         'name', ${
           source.nameColumn
@@ -97,9 +116,11 @@ export const getSchoolsGeoJson = async (pool) => {
             : quoteLiteral(source.label || 'Unnamed School')
         },
         'district', ${source.districtColumn ? `COALESCE(src.${quoteIdentifier(source.districtColumn)}, '')` : "''"},
+        'source_id', src.${quoteIdentifier(source.idColumn || 'gid')},
         'source', ${quoteLiteral(source.tableName)},
         'label', ${quoteLiteral(source.label)},
-        'is_buffer', ${source.isBuffered ? 'true' : 'false'}
+        'is_buffer', ${source.isBuffered ? 'true' : 'false'},
+        'display_geometry', ${source.isBuffered ? quoteLiteral('point_on_buffer') : quoteLiteral('source_geometry')}
       ) AS properties
     FROM ${qualifiedTable(source.tableName)} src
     WHERE src.${quoteIdentifier(source.geomColumn)} IS NOT NULL
@@ -109,7 +130,7 @@ export const getSchoolsGeoJson = async (pool) => {
 };
 
 export const getObstacleGeoJson = async (pool, { schoolBuffer, includeSchoolBuffers = true, includeRivers = true, includeMiningSites = true }) => {
-  const schoolSources = await getExistingSchoolSources(pool);
+  const schoolSources = getSchoolObstacleSources(await getExistingSchoolSources(pool));
   const parts = [];
   const params = [schoolBuffer];
 
@@ -131,7 +152,9 @@ export const getObstacleGeoJson = async (pool, { schoolBuffer, includeSchoolBuff
                 : quoteLiteral(source.label || 'Unnamed School')
             },
             'source', ${quoteLiteral(source.tableName)},
-            'is_buffer', ${source.isBuffered ? 'true' : 'false'}
+            'is_buffer', true,
+            'buffer_distance', ${source.isBuffered ? '0' : '$1'},
+            'source_was_buffered', ${source.isBuffered ? 'true' : 'false'}
           ) AS properties
         FROM ${qualifiedTable(source.tableName)}
         WHERE ${quoteIdentifier(source.geomColumn)} IS NOT NULL

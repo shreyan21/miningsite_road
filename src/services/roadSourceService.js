@@ -1,4 +1,4 @@
-import { reseedBaseRoadNetwork } from './bootstrap.js';
+import { discoverRoadSources, reseedBaseRoadNetwork } from './bootstrap.js';
 import { columnExists, tableExists } from '../utils/sql.js';
 
 export const registerRoadSource = async (pool, payload) => {
@@ -46,5 +46,16 @@ export const registerRoadSource = async (pool, payload) => {
   return {
     success: true,
     message: `Registered ${tableName} as road source ${roadType}.`,
+  };
+};
+
+export const syncRoadSources = async (pool) => {
+  const discovered = await discoverRoadSources(pool);
+  await reseedBaseRoadNetwork(pool);
+
+  return {
+    success: true,
+    message: `Synced road sources from database. Discovered ${discovered.discoveredCount} line-based road table(s).`,
+    discoveredCount: discovered.discoveredCount,
   };
 };

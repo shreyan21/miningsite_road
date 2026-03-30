@@ -1,5 +1,27 @@
-import { DEFAULT_ROAD_SOURCES, TABLES } from '../config/datasets.js';
+import { DEFAULT_ROAD_SOURCES, SCHOOL_SOURCES, TABLES } from '../config/datasets.js';
 import { columnExists, qualifiedTable, quoteIdentifier, tableExists } from '../utils/sql.js';
+
+const ROAD_DISCOVERY_EXCLUSIONS = new Set([
+  TABLES.miningSites,
+  TABLES.rivers,
+  'road_network',
+  'road_source_registry',
+  'mining_connection_status',
+  ...SCHOOL_SOURCES.map((source) => source.tableName),
+]);
+
+const ROAD_CODE_CANDIDATES = ['tr_rdcode', 'road_code', 'rdcode', 'code'];
+const LENGTH_CANDIDATES = ['length_km', 'length', 'shape_leng'];
+
+const deriveRoadTypeFromTableName = (tableName) => {
+  const normalized = String(tableName || '').toLowerCase();
+  if (normalized.includes('national') && normalized.includes('highway')) return 'national_highway';
+  if (normalized.includes('state') && normalized.includes('highway')) return 'state_highway';
+  if (normalized.includes('highway')) return 'highway';
+  if (normalized.includes('expressway')) return 'expressway';
+  if (normalized.includes('road')) return 'road';
+  return 'road';
+};
 
 const SUPPORT_TABLE_SQL = `
   CREATE TABLE IF NOT EXISTS road_source_registry (
@@ -152,6 +174,8 @@ const insertRoadSourceRows = async (pool, source) => {
 };
 
 export const reseedBaseRoadNetwork = async (pool) => {
+  await discoverRoadSources(pool);
+
   const sourceResult = await pool.query(`
     SELECT table_name, road_type, geom_column, length_column, road_code_column
     FROM road_source_registry
@@ -171,6 +195,47 @@ export const reseedBaseRoadNetwork = async (pool) => {
   }
 };
 
+export const discoverRoadSources = async (pool) => {
+  const result = await pool.query(`
+    SELECT
+      gc.f_table_name AS table_name,
+      gc.f_geometry_column AS geom_column,
+      UPPER(gc.type) AS geometry_type
+    FROM geometry_columns gc
+    WHERE gc.f_table_schema = 'public'
+      AND UPPER(gc.type) IN ('LINESTRING', 'MULTILINESTRING')
+    ORDER BY gc.f_table_name
+  `);
+
+  let discoveredCount = 0;
+
+  for (const row of result.rows) {
+    if (ROAD_DISCOVERY_EXCLUSIONS.has(row.table_name)) {
+      continue;
+    }
+
+    const lengthColumn = (await Promise.all(
+      LENGTH_CANDIDATES.map(async (columnName) => ((await columnExists(pool, row.table_name, columnName)) ? columnName : null)),
+    )).find(Boolean);
+
+    const roadCodeColumn = (await Promise.all(
+      ROAD_CODE_CANDIDATES.map(async (columnName) => ((await columnExists(pool, row.table_name, columnName)) ? columnName : null)),
+    )).find(Boolean);
+
+    await insertRoadSource(pool, {
+      tableName: row.table_name,
+      roadType: deriveRoadTypeFromTableName(row.table_name),
+      geomColumn: row.geom_column || 'geom',
+      lengthColumn: lengthColumn || null,
+      roadCodeColumn: roadCodeColumn || null,
+    });
+
+    discoveredCount += 1;
+  }
+
+  return { discoveredCount };
+};
+
 export const bootstrapDatabase = async (pool) => {
   if (!(await tableExists(pool, TABLES.miningSites))) {
     throw new Error(`Mining site table ${TABLES.miningSites} is missing.`);
@@ -182,6 +247,8 @@ export const bootstrapDatabase = async (pool) => {
   for (const source of DEFAULT_ROAD_SOURCES) {
     await insertRoadSource(pool, source);
   }
+
+  await discoverRoadSources(pool);
 
   const roadCountResult = await pool.query('SELECT COUNT(*)::int AS count FROM road_network');
   if (roadCountResult.rows[0].count === 0) {

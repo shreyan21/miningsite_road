@@ -13,6 +13,8 @@ export const SCHOOL_SOURCES = [
     nameColumn: 'schname',
     districtColumn: 'districtna',
     label: 'Education School',
+    useForDisplay: true,
+    useForObstacles: true,
   },
   {
     tableName: 'gorakhpur_ps',
@@ -21,6 +23,8 @@ export const SCHOOL_SOURCES = [
     nameColumn: 'field1',
     districtColumn: 'field2',
     label: 'Point School',
+    useForDisplay: true,
+    useForObstacles: true,
   },
   {
     tableName: 'school_buffer',
@@ -28,6 +32,8 @@ export const SCHOOL_SOURCES = [
     geomColumn: 'geom',
     isBuffered: true,
     label: 'Imported School Buffer',
+    useForDisplay: false,
+    useForObstacles: true,
   },
 ];
 
