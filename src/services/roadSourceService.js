@@ -4,6 +4,7 @@ import { columnExists, tableExists } from '../utils/sql.js';
 export const registerRoadSource = async (pool, payload) => {
   const tableName = String(payload.tableName || '').trim();
   const roadType = String(payload.roadType || '').trim();
+  const sourceIdColumn = payload.sourceIdColumn ? String(payload.sourceIdColumn).trim() : null;
   const geomColumn = String(payload.geomColumn || 'geom').trim();
   const lengthColumn = payload.lengthColumn ? String(payload.lengthColumn).trim() : null;
   const roadCodeColumn = payload.roadCodeColumn ? String(payload.roadCodeColumn).trim() : null;
@@ -20,6 +21,10 @@ export const registerRoadSource = async (pool, payload) => {
     throw new Error(`Column ${geomColumn} does not exist on ${tableName}.`);
   }
 
+  if (sourceIdColumn && !(await columnExists(pool, tableName, sourceIdColumn))) {
+    throw new Error(`Column ${sourceIdColumn} does not exist on ${tableName}.`);
+  }
+
   if (lengthColumn && !(await columnExists(pool, tableName, lengthColumn))) {
     throw new Error(`Column ${lengthColumn} does not exist on ${tableName}.`);
   }
@@ -29,16 +34,17 @@ export const registerRoadSource = async (pool, payload) => {
   }
 
   await pool.query(
-    `INSERT INTO road_source_registry (table_name, road_type, geom_column, length_column, road_code_column)
-     VALUES ($1, $2, $3, $4, $5)
+    `INSERT INTO road_source_registry (table_name, road_type, source_id_column, geom_column, length_column, road_code_column)
+     VALUES ($1, $2, $3, $4, $5, $6)
      ON CONFLICT (table_name)
      DO UPDATE SET
        road_type = EXCLUDED.road_type,
+       source_id_column = EXCLUDED.source_id_column,
        geom_column = EXCLUDED.geom_column,
        length_column = EXCLUDED.length_column,
        road_code_column = EXCLUDED.road_code_column,
        enabled = true`,
-    [tableName, roadType, geomColumn, lengthColumn, roadCodeColumn],
+    [tableName, roadType, sourceIdColumn, geomColumn, lengthColumn, roadCodeColumn],
   );
 
   await reseedBaseRoadNetwork(pool);

@@ -1,8 +1,18 @@
+import { MINING_SITE_FILTER, TABLES } from '../config/datasets.js';
+import { qualifiedTable, quoteIdentifier, quoteLiteral } from '../utils/sql.js';
+
+const buildMiningSiteWhereClause = (tableAlias = null) => {
+  const columnPrefix = tableAlias ? `${tableAlias}.` : '';
+  const values = MINING_SITE_FILTER.includedValues.map((value) => quoteLiteral(value)).join(', ');
+  return `${columnPrefix}${quoteIdentifier(MINING_SITE_FILTER.nameColumn)} IN (${values})`;
+};
+
 export const getStatistics = async (pool) => {
   const result = await pool.query(`
     WITH totals AS (
       SELECT COUNT(*)::int AS total_mining_sites
-      FROM gorakhpur_brickkiln
+      FROM ${qualifiedTable(TABLES.miningSites)}
+      WHERE ${buildMiningSiteWhereClause()}
     ),
     status_counts AS (
       SELECT

@@ -2,7 +2,13 @@ export const DEFAULT_SRID = 32644;
 
 export const TABLES = {
   miningSites: 'gorakhpur_brickkiln',
+  forbiddenMining: 'forbidden_mining',
   rivers: 'uprsac_09xxxx_riverxxxxx_09042018',
+};
+
+export const MINING_SITE_FILTER = {
+  nameColumn: 'name',
+  includedValues: ['Mining Field'],
 };
 
 export const SCHOOL_SOURCES = [

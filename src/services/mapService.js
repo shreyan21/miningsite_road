@@ -1,5 +1,11 @@
-import { PLANNER_METADATA, SCHOOL_SOURCES, TABLES } from '../config/datasets.js';
+import { MINING_SITE_FILTER, PLANNER_METADATA, SCHOOL_SOURCES, TABLES } from '../config/datasets.js';
 import { qualifiedTable, quoteIdentifier, quoteLiteral, tableExists } from '../utils/sql.js';
+
+const buildMiningSiteWhereClause = (tableAlias = null) => {
+  const columnPrefix = tableAlias ? `${tableAlias}.` : '';
+  const values = MINING_SITE_FILTER.includedValues.map((value) => quoteLiteral(value)).join(', ');
+  return `${columnPrefix}${quoteIdentifier(MINING_SITE_FILTER.nameColumn)} IN (${values})`;
+};
 
 const featureCollectionFromRows = (rows) => ({
   type: 'FeatureCollection',
@@ -57,6 +63,7 @@ export const getMiningSitesGeoJson = async (pool) => {
     FROM gorakhpur_brickkiln gb
     LEFT JOIN mining_connection_status mcs ON mcs.mining_gid = gb.gid
     WHERE gb.geom IS NOT NULL
+      AND ${buildMiningSiteWhereClause('gb')}
     ORDER BY gb.gid
   `;
   return loadGeoJsonRows(pool, sql);
@@ -76,6 +83,12 @@ export const getRoadNetworkGeoJson = async (pool) => {
       ) AS properties
     FROM road_network
     WHERE geom IS NOT NULL
+      AND (
+        source_mining_site IS NOT NULL
+        OR road_type IN ('national_highway', 'state_highway', 'highway', 'expressway')
+        OR source_table ILIKE '%highw%'
+        OR source_table ILIKE '%exp%'
+      )
     ORDER BY gid
   `;
   return loadGeoJsonRows(pool, sql);
@@ -181,6 +194,7 @@ export const getObstacleGeoJson = async (pool, { schoolBuffer, includeSchoolBuff
         jsonb_build_object('type', 'mining_site', 'name', COALESCE(name, 'Mining Site')) AS properties
       FROM ${qualifiedTable(TABLES.miningSites)}
       WHERE geom IS NOT NULL
+        AND ${buildMiningSiteWhereClause()}
     `);
   }
 
