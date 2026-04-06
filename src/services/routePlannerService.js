@@ -783,7 +783,7 @@ const solveWithGridFallback = async (
         pathLength: Number(measured.length_m),
         pathCost: cost.pathCost,
         geometry: measured.geometry,
-        geometryWkt: lineWkt(smoothed),
+        geometryWkt: measured.wkt,
         entryPoint: { type: 'Point', coordinates: candidate.startPoint },
         connectionPoint: { type: 'Point', coordinates: candidate.endPoint },
         entryPointWkt: candidate.start_pt_wkt,
@@ -908,9 +908,22 @@ const assessSegmentObstacle = async (
 
 const measurePath = async (pool, points) => {
   const sql = `
+    WITH original AS (
+      SELECT ST_GeomFromText($1, 32644) AS geom
+    ),
+    smoothed AS (
+      SELECT
+        CASE
+          WHEN ST_NumPoints(geom) > 2 THEN ST_ChaikinSmoothing(geom, 3, false)::geometry(LineString, 32644)
+          ELSE geom
+        END AS geom
+      FROM original
+    )
     SELECT
-      ST_Length(ST_GeomFromText($1, 32644)) AS length_m,
-      ST_AsGeoJSON(ST_Transform(ST_GeomFromText($1, 32644), 4326))::jsonb AS geometry
+      ST_Length(geom) AS length_m,
+      ST_AsText(geom) AS wkt,
+      ST_AsGeoJSON(ST_Transform(geom, 4326))::jsonb AS geometry
+    FROM smoothed
   `;
   const result = await pool.query(sql, [lineWkt(points)]);
   return result.rows[0];
