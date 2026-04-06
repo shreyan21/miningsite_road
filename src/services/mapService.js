@@ -57,6 +57,7 @@ export const getMiningSitesGeoJson = async (pool) => {
         'district', gb.district,
         'is_connected', COALESCE(mcs.is_connected, false),
         'connection_cost', mcs.connection_cost,
+        'path_length', mcs.path_length,
         'reason_code', mcs.reason_code,
         'path_strategy', mcs.path_strategy
       ) AS properties

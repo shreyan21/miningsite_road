@@ -10,7 +10,7 @@ const DETOUR_CLEARANCE = 30;
 const PLANNER_MODE = 'obstacle_aware_polyline';
 const TEMP_OBSTACLE_CACHE = 'temp_route_obstacle_cache';
 const GRID_FALLBACK_CANDIDATES = 4;
-const MAX_CANDIDATE_PATH_EVALUATIONS = 36;
+const MAX_CANDIDATE_PATH_EVALUATIONS = 96;
 export const MAX_BATCH_SELECTION = 60;
 export const DEFAULT_BATCH_SELECTION = 4;
 const MAX_GRID_OBSTACLES = 400;
@@ -32,8 +32,11 @@ const SHORT_CONNECTOR_PATH_LENGTH_MAX = 250;
 const MAX_SHORT_CONNECTOR_DETOUR_RATIO = 6;
 const SHORT_CANDIDATE_SKIP_DISTANCE_MAX = 150;
 const FULL_INTERSECTION_RATIO = 0.85;
-const TURN_PENALTY_METERS = 120;
-const ACUTE_TURN_PENALTY_METERS = 120;
+const TURN_PENALTY_METERS = 35;
+const ACUTE_TURN_PENALTY_METERS = 55;
+const MINING_INTERSECTION_TOLERANCE = 1;
+const OBSTACLE_INTERSECTION_TOLERANCE = 1;
+const ROUTE_LENGTH_TIE_TOLERANCE = 25;
 
 const buildMiningSiteWhereClause = (tableAlias = null) => {
   const columnPrefix = tableAlias ? `${tableAlias}.` : '';
@@ -289,10 +292,40 @@ const shouldSkipBlockedShortCandidate = (candidate, obstacle) => {
 
   return (
     directLength > 0
-    && directLength <= SHORT_CANDIDATE_SKIP_DISTANCE_MAX
+    && directLength <= 60
     && obstacle.obstacle_type === 'school_buffer'
-    && intersectionLength >= directLength * FULL_INTERSECTION_RATIO
+    && intersectionLength >= directLength * 0.98
   );
+};
+
+const isRouteBetter = (candidate, currentBest) => {
+  if (!candidate?.connected) {
+    return false;
+  }
+
+  if (!currentBest?.connected) {
+    return true;
+  }
+
+  const candidateLength = Number(candidate.pathLength ?? Number.POSITIVE_INFINITY);
+  const currentLength = Number(currentBest.pathLength ?? Number.POSITIVE_INFINITY);
+
+  if (candidateLength + ROUTE_LENGTH_TIE_TOLERANCE < currentLength) {
+    return true;
+  }
+
+  if (currentLength + ROUTE_LENGTH_TIE_TOLERANCE < candidateLength) {
+    return false;
+  }
+
+  const candidateCost = Number(candidate.pathCost ?? candidateLength);
+  const currentCost = Number(currentBest.pathCost ?? currentLength);
+
+  if (candidateCost !== currentCost) {
+    return candidateCost < currentCost;
+  }
+
+  return candidateLength < currentLength;
 };
 
 const optimizePathShape = async (
@@ -372,6 +405,7 @@ const createObstacleCache = async (db, schoolSources, schoolBuffer) => {
     SELECT
       'school_buffer'::text AS obstacle_type,
       ${quoteIdentifier(source.idColumn || 'gid')} AS obstacle_gid,
+      NULL::integer AS obstacle_source_mining_site,
       ${
         source.isBuffered
           ? `${quoteIdentifier(source.geomColumn)}::geometry`
@@ -387,6 +421,7 @@ const createObstacleCache = async (db, schoolSources, schoolBuffer) => {
       SELECT
         'river'::text AS obstacle_type,
         gid AS obstacle_gid,
+        NULL::integer AS obstacle_source_mining_site,
         geom AS obstacle_geom
       FROM ${qualifiedTable(TABLES.rivers)}
       WHERE geom IS NOT NULL
@@ -395,6 +430,7 @@ const createObstacleCache = async (db, schoolSources, schoolBuffer) => {
       SELECT
         'mining_site'::text AS obstacle_type,
         gid AS obstacle_gid,
+        NULL::integer AS obstacle_source_mining_site,
         geom AS obstacle_geom
       FROM ${qualifiedTable(TABLES.miningSites)}
       WHERE geom IS NOT NULL
@@ -404,6 +440,7 @@ const createObstacleCache = async (db, schoolSources, schoolBuffer) => {
       SELECT
         'forbidden_mining'::text AS obstacle_type,
         ROW_NUMBER() OVER ()::integer AS obstacle_gid,
+        NULL::integer AS obstacle_source_mining_site,
         geom AS obstacle_geom
       FROM ${qualifiedTable(TABLES.forbiddenMining)}
       WHERE geom IS NOT NULL
@@ -412,10 +449,10 @@ const createObstacleCache = async (db, schoolSources, schoolBuffer) => {
       SELECT
         'road_barrier'::text AS obstacle_type,
         gid AS obstacle_gid,
+        source_mining_site AS obstacle_source_mining_site,
         ST_Buffer(geom, ${ROAD_BARRIER_BUFFER})::geometry(Polygon, 32644) AS obstacle_geom
       FROM road_network
       WHERE geom IS NOT NULL
-        AND source_mining_site IS NULL
     `,
   ].join(' UNION ALL ');
 
@@ -442,6 +479,7 @@ const buildObstacleUnionSql = (
     SELECT
       'school_buffer'::text AS obstacle_type,
       ${quoteIdentifier(source.idColumn || 'gid')} AS obstacle_gid,
+      NULL::integer AS obstacle_source_mining_site,
       ${
         source.isBuffered
           ? `${quoteIdentifier(source.geomColumn)}::geometry`
@@ -457,6 +495,7 @@ const buildObstacleUnionSql = (
       SELECT
         'river'::text AS obstacle_type,
         gid AS obstacle_gid,
+        NULL::integer AS obstacle_source_mining_site,
         geom AS obstacle_geom
       FROM ${qualifiedTable(TABLES.rivers)}
       WHERE geom IS NOT NULL
@@ -465,6 +504,7 @@ const buildObstacleUnionSql = (
       SELECT
         'mining_site'::text AS obstacle_type,
         gid AS obstacle_gid,
+        NULL::integer AS obstacle_source_mining_site,
         geom AS obstacle_geom
       FROM ${qualifiedTable(TABLES.miningSites)}
       WHERE gid <> ${miningGid}
@@ -475,6 +515,7 @@ const buildObstacleUnionSql = (
       SELECT
         'forbidden_mining'::text AS obstacle_type,
         ROW_NUMBER() OVER ()::integer AS obstacle_gid,
+        NULL::integer AS obstacle_source_mining_site,
         geom AS obstacle_geom
       FROM ${qualifiedTable(TABLES.forbiddenMining)}
       WHERE geom IS NOT NULL
@@ -483,10 +524,10 @@ const buildObstacleUnionSql = (
       SELECT
         'road_barrier'::text AS obstacle_type,
         gid AS obstacle_gid,
+        source_mining_site AS obstacle_source_mining_site,
         ST_Buffer(geom, ${ROAD_BARRIER_BUFFER})::geometry(Polygon, 32644) AS obstacle_geom
       FROM road_network
       WHERE geom IS NOT NULL
-        AND source_mining_site IS NULL
         AND gid <> COALESCE(${excludeRoadGidLiteral}, -1)
     `,
   ];
@@ -517,6 +558,7 @@ const fetchCandidateRoutes = async (pool, miningGid, limit = CANDIDATE_LIMIT) =>
       SELECT
         rn.gid AS road_gid,
         rn.road_type,
+        rn.source_mining_site,
         ST_ClosestPoint(s.boundary_geom, rn.geom) AS start_pt,
         ST_ClosestPoint(rn.geom, ST_ClosestPoint(s.boundary_geom, rn.geom)) AS end_pt,
         ST_Distance(rn.geom, s.boundary_geom) AS boundary_distance,
@@ -539,6 +581,7 @@ const fetchCandidateRoutes = async (pool, miningGid, limit = CANDIDATE_LIMIT) =>
     SELECT
       road_gid,
       road_type,
+      source_mining_site,
       ST_AsText(start_pt) AS start_pt_wkt,
       ST_AsText(end_pt) AS end_pt_wkt,
       boundary_distance,
@@ -587,6 +630,7 @@ const fetchLocalObstacles = async (
         ST_MakeEnvelope($1, $2, $3, $4, 32644)
       )
       AND NOT (obstacle_type = 'mining_site' AND obstacle_gid = $5)
+      AND NOT (obstacle_type = 'road_barrier' AND obstacle_source_mining_site = $5)
       AND NOT (obstacle_type = 'road_barrier' AND obstacle_gid = COALESCE($6, -1))
     `
     : `
@@ -831,6 +875,7 @@ const assessSegmentObstacle = async (
     FROM ${obstacleCacheTable}, route
     WHERE ST_Intersects(obstacle_geom, route.route_geom)
       AND NOT (obstacle_type = 'mining_site' AND obstacle_gid = $2)
+      AND NOT (obstacle_type = 'road_barrier' AND obstacle_source_mining_site = $2)
       AND NOT (obstacle_type = 'road_barrier' AND obstacle_gid = COALESCE($3, -1))
     ORDER BY intersection_length DESC NULLS LAST, intersection_area DESC NULLS LAST, obstacle_type
     LIMIT 1
@@ -887,6 +932,7 @@ const createDetourPath = async (
       SELECT obstacle_type, obstacle_gid, obstacle_geom
       FROM ${obstacleCacheTable}
       WHERE NOT (obstacle_type = 'mining_site' AND obstacle_gid = ${miningGid})
+        AND NOT (obstacle_type = 'road_barrier' AND obstacle_source_mining_site = ${miningGid})
         AND NOT (obstacle_type = 'road_barrier' AND obstacle_gid = COALESCE(${excludeRoadGid ?? 'NULL'}, -1))
     `
     : buildObstacleUnionSql(schoolSources, miningGid, '$5', excludeRoadGid == null ? 'NULL' : String(excludeRoadGid));
@@ -1144,7 +1190,7 @@ const solveCandidatePath = async (pool, schoolSources, miningGid, schoolBuffer, 
 
     const clearance =
       blockingObstacle.obstacle_type === 'school_buffer'
-        ? Math.max(DETOUR_CLEARANCE, schoolBuffer * 0.2)
+        ? Math.max(DETOUR_CLEARANCE, schoolBuffer * 0.45)
         : blockingObstacle.obstacle_type === 'river'
           ? Math.max(DETOUR_CLEARANCE, 60)
           : blockingObstacle.obstacle_type === 'road_barrier'
@@ -1318,8 +1364,13 @@ const findShortestDirectCandidateRoute = async (
   miningGid,
   schoolBuffer,
   obstacleCacheTable = null,
+  options = {},
 ) => {
+  const { baseRoadsOnly = false } = options;
   const limit = 8;
+  const roadScopeCondition = baseRoadsOnly
+    ? 'rn.source_mining_site IS NULL'
+    : '(rn.source_mining_site IS NULL OR rn.source_mining_site <> $1)';
   const obstacleSql = obstacleCacheTable
     ? `
       SELECT 1
@@ -1329,6 +1380,7 @@ const findShortestDirectCandidateRoute = async (
         ST_MakeLine(start_pt, end_pt)
       )
       AND NOT (obstacle_union.obstacle_type = 'mining_site' AND obstacle_union.obstacle_gid = $3)
+      AND NOT (obstacle_union.obstacle_type = 'road_barrier' AND obstacle_union.obstacle_source_mining_site = $1)
       AND NOT (obstacle_union.obstacle_type = 'road_barrier' AND obstacle_union.obstacle_gid = road_gid)
     `
     : `
@@ -1351,6 +1403,7 @@ const findShortestDirectCandidateRoute = async (
       SELECT
         rn.gid AS road_gid,
         rn.road_type,
+        rn.source_mining_site,
         ST_ClosestPoint(s.boundary_geom, rn.geom) AS start_pt,
         ST_ClosestPoint(rn.geom, ST_ClosestPoint(s.boundary_geom, rn.geom)) AS end_pt,
         ST_Distance(rn.geom, s.boundary_geom) AS boundary_distance,
@@ -1360,7 +1413,7 @@ const findShortestDirectCandidateRoute = async (
       FROM road_network rn
       CROSS JOIN site s
       WHERE rn.geom IS NOT NULL
-        AND rn.source_mining_site IS NULL
+        AND ${roadScopeCondition}
     ),
     candidate_roads AS (
       SELECT *
@@ -1371,6 +1424,7 @@ const findShortestDirectCandidateRoute = async (
       SELECT
         road_gid,
         road_type,
+        source_mining_site,
         start_pt,
         end_pt,
         ST_AsText(start_pt) AS start_pt_wkt,
@@ -1394,6 +1448,91 @@ const findShortestDirectCandidateRoute = async (
   const result = await pool.query(sql, params);
   const row = result.rows[0];
 
+  if (!row) {
+    return null;
+  }
+
+  const route = {
+    connected: true,
+    roadGid: row.road_gid,
+    pathLength: Number(row.direct_length_m),
+    pathCost: Number(row.direct_length_m),
+    geometry: row.geometry,
+    geometryWkt: lineWkt([parsePointWkt(row.start_pt_wkt), parsePointWkt(row.end_pt_wkt)]),
+    entryPoint: {
+      type: 'Point',
+      coordinates: parsePointWkt(row.start_pt_wkt),
+    },
+    connectionPoint: {
+      type: 'Point',
+      coordinates: parsePointWkt(row.end_pt_wkt),
+    },
+    entryPointWkt: row.start_pt_wkt,
+    connectionPointWkt: row.end_pt_wkt,
+    isCurved: false,
+    plannerMode: 'direct_visible_shortest_route',
+  };
+
+  return isRouteQualityAcceptable(route) ? route : null;
+};
+
+const findShortestClearBaseRoadRoute = async (pool, miningGid, obstacleCacheTable = null) => {
+  if (!obstacleCacheTable) {
+    return null;
+  }
+
+  const result = await pool.query(
+    `
+      WITH site AS (
+        SELECT gid, geom, ST_Boundary(geom) AS boundary_geom
+        FROM ${qualifiedTable(TABLES.miningSites)}
+        WHERE gid = $1
+          AND ${buildMiningSiteWhereClause()}
+      ),
+      ranked_roads AS (
+        SELECT
+          rn.gid AS road_gid,
+          rn.road_type,
+          ST_ClosestPoint(s.boundary_geom, rn.geom) AS start_pt,
+          ST_ClosestPoint(rn.geom, ST_ClosestPoint(s.boundary_geom, rn.geom)) AS end_pt,
+          ROW_NUMBER() OVER (
+            ORDER BY ST_Distance(rn.geom, s.boundary_geom), rn.geom <-> s.boundary_geom, rn.gid
+          ) AS road_rank
+        FROM road_network rn
+        CROSS JOIN site s
+        WHERE rn.geom IS NOT NULL
+          AND rn.source_mining_site IS NULL
+      ),
+      candidate_roads AS (
+        SELECT * FROM ranked_roads WHERE road_rank <= 8
+      ),
+      visible_candidates AS (
+        SELECT
+          road_gid,
+          road_type,
+          ST_AsText(start_pt) AS start_pt_wkt,
+          ST_AsText(end_pt) AS end_pt_wkt,
+          ST_Length(ST_MakeLine(start_pt, end_pt)) AS direct_length_m,
+          ST_AsGeoJSON(ST_Transform(ST_MakeLine(start_pt, end_pt), 4326))::jsonb AS geometry
+        FROM candidate_roads
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM ${obstacleCacheTable} obstacle_union
+          WHERE ST_Intersects(obstacle_union.obstacle_geom, ST_MakeLine(start_pt, end_pt))
+            AND NOT (obstacle_union.obstacle_type = 'mining_site' AND obstacle_union.obstacle_gid = $1)
+            AND NOT (obstacle_union.obstacle_type = 'road_barrier' AND obstacle_union.obstacle_source_mining_site = $1)
+            AND NOT (obstacle_union.obstacle_type = 'road_barrier' AND obstacle_union.obstacle_gid = road_gid)
+        )
+      )
+      SELECT *
+      FROM visible_candidates
+      ORDER BY direct_length_m, road_gid
+      LIMIT 1
+    `,
+    [miningGid],
+  );
+
+  const row = result.rows[0];
   if (!row) {
     return null;
   }
@@ -1454,14 +1593,14 @@ const validateRouteAgainstMiningSites = async (pool, miningGid, geometryWkt) => 
         FROM route r
         JOIN source_site s ON true
         WHERE ST_Intersects(r.geom, s.geom)
-          AND NOT ST_Touches(r.geom, s.geom)
+          AND ST_Length(ST_Intersection(r.geom, s.geom)) > ${MINING_INTERSECTION_TOLERANCE}
       ) AS crosses_source_interior,
       EXISTS (
         SELECT 1
         FROM route r
         JOIN other_sites s ON true
         WHERE ST_Intersects(r.geom, s.geom)
-          AND NOT ST_Touches(r.geom, s.geom)
+          AND ST_Length(ST_Intersection(r.geom, s.geom)) > ${MINING_INTERSECTION_TOLERANCE}
       ) AS crosses_other_site,
       EXISTS (
         SELECT 1
@@ -1491,6 +1630,95 @@ const validateRouteAgainstMiningSites = async (pool, miningGid, geometryWkt) => 
   }
 
   return { valid: true };
+};
+
+const validateRouteAgainstProtectedObstacles = async (
+  pool,
+  schoolSources,
+  miningGid,
+  schoolBuffer,
+  geometryWkt,
+  obstacleCacheTable = null,
+) => {
+  const sql = obstacleCacheTable
+    ? `
+      WITH route AS (
+        SELECT ST_GeomFromText($1, 32644) AS geom
+      )
+      SELECT
+        obstacle_type,
+        ST_Length(ST_Intersection(obstacle_geom, route.geom)) AS intersection_length
+      FROM ${obstacleCacheTable}, route
+      WHERE obstacle_type IN ('school_buffer', 'river')
+        AND ST_Intersects(obstacle_geom, route.geom)
+        AND ST_Length(ST_Intersection(obstacle_geom, route.geom)) > ${OBSTACLE_INTERSECTION_TOLERANCE}
+      ORDER BY intersection_length DESC NULLS LAST, obstacle_type
+      LIMIT 1
+    `
+    : `
+      WITH route AS (
+        SELECT ST_GeomFromText($1, 32644) AS geom
+      ),
+      obstacles AS (
+        ${buildObstacleUnionSql(schoolSources, miningGid, '$2')}
+      )
+      SELECT
+        obstacle_type,
+        ST_Length(ST_Intersection(obstacle_geom, route.geom)) AS intersection_length
+      FROM obstacles, route
+      WHERE obstacle_type IN ('school_buffer', 'river')
+        AND ST_Intersects(obstacle_geom, route.geom)
+        AND ST_Length(ST_Intersection(obstacle_geom, route.geom)) > ${OBSTACLE_INTERSECTION_TOLERANCE}
+      ORDER BY intersection_length DESC NULLS LAST, obstacle_type
+      LIMIT 1
+    `;
+
+  const result = await pool.query(
+    sql,
+    obstacleCacheTable ? [geometryWkt] : [geometryWkt, schoolBuffer],
+  );
+  const row = result.rows[0];
+
+  if (!row) {
+    return { valid: true };
+  }
+
+  if (row.obstacle_type === 'school_buffer') {
+    return {
+      valid: false,
+      reasonCode: 'SCHOOL_BUFFER_BLOCK',
+      reasonDetail: 'The generated road would touch a school buffer, so it was rejected.',
+    };
+  }
+
+  return {
+    valid: false,
+    reasonCode: 'RIVER_BARRIER',
+    reasonDetail: 'The generated road would still touch a river polygon, so it was rejected.',
+  };
+};
+
+const validateRouteAgainstRules = async (
+  pool,
+  schoolSources,
+  miningGid,
+  schoolBuffer,
+  geometryWkt,
+  obstacleCacheTable = null,
+) => {
+  const miningValidation = await validateRouteAgainstMiningSites(pool, miningGid, geometryWkt);
+  if (!miningValidation.valid) {
+    return miningValidation;
+  }
+
+  return validateRouteAgainstProtectedObstacles(
+    pool,
+    schoolSources,
+    miningGid,
+    schoolBuffer,
+    geometryWkt,
+    obstacleCacheTable,
+  );
 };
 
 const removeRoutesForMiningSitesInternal = async (pool, miningGids) => {
@@ -1575,7 +1803,35 @@ export const calculateRouteForMiningSite = async (
   const resolvedSchoolSources = getObstacleSchoolSources(
     schoolSources || (await getExistingSchoolSources(pool)),
   );
+  let bestConnected = null;
   let bestBlocked = null;
+  const directBaseRoadRoute = await findShortestClearBaseRoadRoute(
+    pool,
+    miningGid,
+    obstacleCacheTable,
+  );
+
+  if (directBaseRoadRoute) {
+    const routeValidation = await validateRouteAgainstRules(
+      pool,
+      resolvedSchoolSources,
+      miningGid,
+      schoolBuffer,
+      directBaseRoadRoute.geometryWkt,
+      obstacleCacheTable,
+    );
+
+    if (routeValidation.valid) {
+      bestConnected = directBaseRoadRoute;
+    } else {
+      bestBlocked = {
+        connected: false,
+        reasonCode: routeValidation.reasonCode,
+        reasonDetail: routeValidation.reasonDetail,
+      };
+    }
+  }
+
   const directVisibleRoute = await findShortestDirectCandidateRoute(
     pool,
     resolvedSchoolSources,
@@ -1585,49 +1841,28 @@ export const calculateRouteForMiningSite = async (
   );
 
   if (directVisibleRoute) {
-    const routeValidation = await validateRouteAgainstMiningSites(
+    const routeValidation = await validateRouteAgainstRules(
       pool,
+      resolvedSchoolSources,
       miningGid,
+      schoolBuffer,
       directVisibleRoute.geometryWkt,
+      obstacleCacheTable,
     );
 
     if (!routeValidation.valid) {
-      bestBlocked = {
-        connected: false,
-        reasonCode: routeValidation.reasonCode,
-        reasonDetail: routeValidation.reasonDetail,
-      };
-    } else {
-      let generatedRoadGid = null;
-
-      if (persist) {
-        generatedRoadGid = await persistConnectedRoute(
-          pool,
-          miningGid,
-          schoolBuffer,
-          directVisibleRoute,
-        );
+      if (!bestBlocked) {
+        bestBlocked = {
+          connected: false,
+          reasonCode: routeValidation.reasonCode,
+          reasonDetail: routeValidation.reasonDetail,
+        };
       }
-
-      return {
-        miningGid,
-        miningName: miningSite.name,
-        connected: true,
-        schoolBuffer,
-        plannerMode: directVisibleRoute.plannerMode,
-        roadGid: directVisibleRoute.roadGid,
-        generatedRoadGid,
-        pathLength: directVisibleRoute.pathLength,
-        pathCost: directVisibleRoute.pathCost,
-        geometry: directVisibleRoute.geometry,
-        entryPoint: directVisibleRoute.entryPoint,
-        connectionPoint: directVisibleRoute.connectionPoint,
-        isCurved: directVisibleRoute.isCurved,
-      };
+    } else if (isRouteBetter(directVisibleRoute, bestConnected)) {
+      bestConnected = directVisibleRoute;
     }
   }
 
-  let bestConnected = null;
   const seenRoads = new Set();
   const candidatePool = [];
   const gridTestedRoads = new Set();
@@ -1653,20 +1888,16 @@ export const calculateRouteForMiningSite = async (
         gridOutcome
         && isRouteQualityAcceptable(gridOutcome)
       ) {
-        const routeValidation = await validateRouteAgainstMiningSites(
+        const routeValidation = await validateRouteAgainstRules(
           pool,
+          resolvedSchoolSources,
           miningGid,
+          schoolBuffer,
           gridOutcome.geometryWkt,
+          obstacleCacheTable,
         );
 
-        if (
-          routeValidation.valid
-          && (
-            !bestConnected
-            || gridOutcome.pathCost < bestConnected.pathCost
-            || (gridOutcome.pathCost === bestConnected.pathCost && gridOutcome.pathLength < bestConnected.pathLength)
-          )
-        ) {
+        if (routeValidation.valid && isRouteBetter(gridOutcome, bestConnected)) {
           bestConnected = gridOutcome;
         } else if (!routeValidation.valid && !bestBlocked) {
           bestBlocked = {
@@ -1682,6 +1913,9 @@ export const calculateRouteForMiningSite = async (
   for (const limit of [...QUICK_CANDIDATE_LIMIT_STEPS, ...EXTENDED_CANDIDATE_LIMIT_STEPS]) {
     const candidates = await fetchCandidateRoutes(pool, miningGid, limit);
     let remainingCandidateCanBeatBest = false;
+    const shortestBaseDirectLength = candidates
+      .filter((candidate) => candidate.source_mining_site == null)
+      .reduce((best, candidate) => Math.min(best, Number(candidate.direct_length_m)), Number.POSITIVE_INFINITY);
 
     for (const candidate of candidates) {
       if (seenRoads.has(candidate.road_gid)) {
@@ -1691,6 +1925,14 @@ export const calculateRouteForMiningSite = async (
       candidatePool.push(candidate);
 
       if (bestConnected && Number(candidate.direct_length_m) >= bestConnected.pathLength) {
+        continue;
+      }
+
+      if (
+        candidate.source_mining_site != null
+        && Number.isFinite(shortestBaseDirectLength)
+        && shortestBaseDirectLength < Number(candidate.direct_length_m)
+      ) {
         continue;
       }
 
@@ -1734,20 +1976,16 @@ export const calculateRouteForMiningSite = async (
         outcome.connected
         && isRouteQualityAcceptable(outcome)
       ) {
-        const routeValidation = await validateRouteAgainstMiningSites(
+        const routeValidation = await validateRouteAgainstRules(
           pool,
+          resolvedSchoolSources,
           miningGid,
+          schoolBuffer,
           outcome.geometryWkt,
+          obstacleCacheTable,
         );
 
-        if (
-          routeValidation.valid
-          && (
-            !bestConnected
-            || outcome.pathCost < bestConnected.pathCost
-            || (outcome.pathCost === bestConnected.pathCost && outcome.pathLength < bestConnected.pathLength)
-          )
-        ) {
+        if (routeValidation.valid && isRouteBetter(outcome, bestConnected)) {
           bestConnected = outcome;
         } else if (!routeValidation.valid && !bestBlocked) {
           bestBlocked = {
