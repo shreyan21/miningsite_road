@@ -152,7 +152,7 @@ export const getObstacleGeoJson = async (pool, { schoolBuffer, includeSchoolBuff
     for (const source of schoolSources) {
       parts.push(`
         SELECT
-          ${quoteIdentifier(source.idColumn || 'gid')} AS id,
+          ${quoteLiteral(`${source.tableName}:`)} || ${quoteIdentifier(source.idColumn || 'gid')}::text AS id,
           ST_AsGeoJSON(ST_Transform(${
             source.isBuffered
               ? quoteIdentifier(source.geomColumn)
@@ -179,7 +179,7 @@ export const getObstacleGeoJson = async (pool, { schoolBuffer, includeSchoolBuff
   if (includeRivers && await tableExists(pool, TABLES.rivers)) {
     parts.push(`
       SELECT
-        gid AS id,
+        'river:' || gid::text AS id,
         ST_AsGeoJSON(ST_Transform(geom, 4326))::jsonb AS geometry,
         jsonb_build_object('type', 'river', 'name', wetname) AS properties
       FROM ${qualifiedTable(TABLES.rivers)}
@@ -190,7 +190,7 @@ export const getObstacleGeoJson = async (pool, { schoolBuffer, includeSchoolBuff
   if (includeMiningSites) {
     parts.push(`
       SELECT
-        gid AS id,
+        'mining_site:' || gid::text AS id,
         ST_AsGeoJSON(ST_Transform(geom, 4326))::jsonb AS geometry,
         jsonb_build_object('type', 'mining_site', 'name', COALESCE(name, 'Mining Site')) AS properties
       FROM ${qualifiedTable(TABLES.miningSites)}
